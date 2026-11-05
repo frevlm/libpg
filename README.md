@@ -15,7 +15,7 @@ PostgreSQL 的 C++20 客户端库，直接基于 libpq：连接池、参数化 S
 cmake -S . -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
 ```
 
-`pg_ctl` 不在 PATH 时用 `-DLIBPG_PG_CTL=/path/to/pg_ctl` 指定。
+`pg_ctl` 不在 PATH 时用 `-DLIBPG_PG_CTL=/path/to/pg_ctl` 指定。给出 `-DLIBPG_REVLM_SCHEMA=...` / `-DLIBPG_HHHOJ_SCHEMA=...`（schema.sql 路径）时，额外测试 `pg_tablegen` 对这两个项目的输出能编译。
 
 ## 在项目里使用
 
