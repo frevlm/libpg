@@ -1,7 +1,7 @@
 # libpg
 
 PostgreSQL 的 C++20 客户端库，直接基于 libpq：连接池、参数化 SQL、带类型的结果、事务，
-以及把数据库格子当变量用的 `pg::sql<Col>` / `pg::cached<Col>`。设计见 [docs/design.md](docs/design.md)。
+以及把数据库格子当变量用的 `pg::sql<Col>` / `pg::cached<Col>`。术语见 [CONTEXT.md](CONTEXT.md)，设计决定见 [docs/adr/](docs/adr/)。
 
 ## 依赖
 

@@ -2,7 +2,7 @@
 //
 // Creates a throwaway database on the server, runs schema.sql in it, reads the
 // resulting tables from pg_catalog and writes one column tag per column
-// (docs/design.md, "Generated column tags"). The database is always dropped.
+// (CONTEXT.md, 列标签). The database is always dropped.
 
 #include <libpq-fe.h>
 

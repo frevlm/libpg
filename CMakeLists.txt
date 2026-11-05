@@ -32,7 +32,7 @@ if(LIBPG_FORCE_LIBPQ16_PATH)
 endif()
 
 # Reads a schema.sql into a scratch schema of a live database and writes the
-# column tags of its tables (docs/design.md, "Generated tags").
+# column tags of its tables (CONTEXT.md, 列标签).
 add_executable(pg_tablegen tools/pg_tablegen.cpp)
 target_link_libraries(pg_tablegen PRIVATE PostgreSQL::PostgreSQL)
 target_compile_options(pg_tablegen PRIVATE -Wall -Wextra -Wpedantic)
