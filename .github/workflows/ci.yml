@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # libpq 16: the pre-17 engine path
+          - name: ubuntu-gcc-pg16
+            os: ubuntu-24.04
+            pg_ctl: /usr/lib/postgresql/16/bin/pg_ctl
+          # libpq 18: the 17+ engine path
+          - name: macos-clang-pg18
+            os: macos-15
+            pg_ctl: /opt/homebrew/opt/postgresql@18/bin/pg_ctl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libpq-dev postgresql-16 catch2
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja libpq postgresql@18 catch2
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLIBPG_BENCH=ON -DLIBPG_PG_CTL=${{ matrix.pg_ctl }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
