@@ -5,7 +5,7 @@ PostgreSQL 的 C++20 客户端库，直接基于 libpq：连接池、参数化 S
 
 ## 依赖
 
-- CMake ≥ 3.25，C++20 编译器
+- CMake ≥ 3.25，C++20 编译器，标准库要支持浮点 `std::from_chars`（GCC ≥ 11；macOS 需 Xcode ≥ 26 或 LLVM ≥ 20）
 - libpq ≥ 14（≥ 17 时使用新的 pipeline 接口）
 - 测试：Catch2 3、PostgreSQL 服务端程序（`initdb`/`pg_ctl`）
 

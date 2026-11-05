@@ -20,10 +20,10 @@ jobs:
             pg_ctl: /usr/lib/postgresql/16/bin/pg_ctl
           # libpq 18: the 17+ engine path
           - name: macos-clang-pg18
-            os: macos-15
+            os: macos-26
             pg_ctl: /opt/homebrew/opt/postgresql@18/bin/pg_ctl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies (Ubuntu)
         if: runner.os == 'Linux'
