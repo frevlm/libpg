@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(libpg VERSION 0.1.0 LANGUAGES CXX)
+project(libpg VERSION 0.1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,6 +21,7 @@ add_library(pg
   src/cached.cpp
 )
 target_include_directories(pg PUBLIC include)
+target_compile_features(pg PUBLIC cxx_std_20)
 target_link_libraries(pg PUBLIC PostgreSQL::PostgreSQL Threads::Threads)
 target_compile_options(pg PRIVATE -Wall -Wextra -Wpedantic)
 # Uses the libpq 14-16 calls (PQpipelineSync, DEALLOCATE) even when newer ones exist,

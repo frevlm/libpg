@@ -43,3 +43,8 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: Build as a subproject
+        run: |
+          cmake -S tests/consumer -B build-consumer -G Ninja -DLIBPG_SOURCE_DIR=$PWD
+          cmake --build build-consumer
