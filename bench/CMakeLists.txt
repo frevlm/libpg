@@ -8,6 +8,9 @@ add_executable(pg_bench
   harness.cpp
   scn_raw.cpp
   scn_v1.cpp
+  scn_v2.cpp
+  scn_list.cpp
+  scn_real.cpp
   summarize.cpp
 )
 target_link_libraries(pg_bench PRIVATE pg)

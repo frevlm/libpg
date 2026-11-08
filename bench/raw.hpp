@@ -32,7 +32,7 @@ inline void expect(const PgResult& r, ExecStatusType want, PGconn* c) {
     if (PQresultStatus(r.get()) != want) fail(c, PQresStatus(PQresultStatus(r.get())));
 }
 
-// A connection with the same session settings pg::connect applies.
+// A connection with fixed text-format session settings.
 class Link {
 public:
     explicit Link(const std::string& dsn) : c(PQconnectdb(dsn.c_str())) {

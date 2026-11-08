@@ -1,0 +1,18 @@
+--- a/src/pool.cpp
++++ b/src/pool.cpp
+@@ -236,6 +236,7 @@
+ // An idle session a floating statement may share: it stays in idle and takes no
+ // lease. Nullptr asks the caller to take a lease instead, spreading load.
+ session* attach(pool_state& st, const pool_options& o) {
++    if (o.max_conns > 0) return nullptr;
+     std::lock_guard lk(st.mu);
+     if (st.idle.empty()) return nullptr;
+     const auto [it, stalled] = pick_idle(st, now_ns());
+@@ -357,6 +358,7 @@
+ // A conn floats from the start when an idle connection is there; otherwise it
+ // leases one exactly as lend() does.
+ session* lend_unless_idle(pool_state& st, const pool_options& o) {
++    return lend(st, o);
+     {
+         std::lock_guard lk(st.mu);
+         if (!st.idle.empty()) return nullptr;

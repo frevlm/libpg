@@ -1,6 +1,6 @@
-// pg_bench: benchmarks of libpg v1 and of raw-libpq prototypes of the planned engine.
+// pg_bench: benchmarks of libpg and of raw-libpq prototypes of its engine.
 //   pg_bench [--dsn DSN] [--duration S] [--threads "1 2 4"] [--pool "8 16"]
-//            [--pc-threads "8 16"] [--pc-pool "4 8"] [--list] [SCENARIO...]
+//            [--pc-threads "8 16"] [--pc-pool "4 8"] [--pooler] [--list] [SCENARIO...]
 //   pg_bench --summarize results.csv        (markdown report on stdout)
 // Every measured point prints: scenario,threads,pool,ops_per_sec,p50_us,p99_us,p999_us,extra
 #include <cstdio>
@@ -18,7 +18,7 @@ using bench::Scenario;
 
 [[noreturn]] void usage() {
     std::fputs("usage: pg_bench [--dsn DSN] [--duration S] [--threads L] [--pool L] [--pc-threads L] "
-               "[--pc-pool L] [--list] [SCENARIO...]\n       pg_bench --summarize results.csv\n",
+               "[--pc-pool L] [--pooler] [--list] [SCENARIO...]\n       pg_bench --summarize results.csv\n",
                stderr);
     std::exit(2);
 }
@@ -45,6 +45,7 @@ Args parse(int argc, char** argv) {
         else if (arg == "--pool") a.cfg.pools = bench::parse_list(value());
         else if (arg == "--pc-threads") a.cfg.pc_threads = bench::parse_list(value());
         else if (arg == "--pc-pool") a.cfg.pc_pools = bench::parse_list(value());
+        else if (arg == "--pooler") a.cfg.pooler = true;
         else if (arg == "--list") a.list = true;
         else if (arg == "--summarize") a.summarize = value();
         else if (arg.starts_with("--")) usage();
@@ -72,7 +73,6 @@ int run_all(const Args& a, const std::vector<Scenario>& all) {
             ++failures;
         }
     }
-    pg::shutdown();
     return failures ? 1 : 0;
 }
 
@@ -85,6 +85,9 @@ int main(int argc, char** argv) {
         std::vector<Scenario> all;
         bench::register_raw(all);
         bench::register_v1(all);
+        bench::register_v2(all);
+        bench::register_list(all);
+        bench::register_real(all);
         if (a.list) {
             for (const auto& s : all) std::puts(s.name);
             return 0;

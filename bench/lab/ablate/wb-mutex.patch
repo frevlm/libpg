@@ -1,0 +1,39 @@
+--- a/src/writeback.hpp
++++ b/src/writeback.hpp
+@@ -41,34 +41,9 @@
+ // different threads does not share one.
+ inline constexpr std::size_t cache_line = 128;
+ 
+-// A lock for short critical sections: spins, then yields the CPU.
+-class spin_mutex {
+-public:
+-    void lock() noexcept {
+-        for (int spins = 0;;) {
+-            if (!locked_.exchange(true, std::memory_order_acquire)) return;
+-            while (locked_.load(std::memory_order_relaxed)) {
+-                if (++spins < 128) relax();
+-                else std::this_thread::yield();
+-            }
+-        }
+-    }
+-    bool try_lock() noexcept {
+-        return !locked_.load(std::memory_order_relaxed) && !locked_.exchange(true, std::memory_order_acquire);
+-    }
+-    void unlock() noexcept { locked_.store(false, std::memory_order_release); }
++// A plain mutex in place of the spin lock.
++class spin_mutex : public std::mutex {};
+ 
+-private:
+-    static void relax() noexcept {
+-#if defined(__aarch64__)
+-        __asm__ __volatile__("yield");
+-#elif defined(__x86_64__) || defined(__i386__)
+-        __builtin_ia32_pause();
+-#endif
+-    }
+-    std::atomic<bool> locked_{false};
+-};
+-
+ // The one copy of a cell in this process. value = committed + pending, where
+ // pending is the sum of this process's recorded, unsettled deltas. Guarded by
+ // its shard's lock; c, key and shard never change.

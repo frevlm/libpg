@@ -157,6 +157,7 @@ struct Cfg {
     std::vector<int> pools{8, 16, 32};
     std::vector<int> pc_threads{8, 16, 32, 64, 128};
     std::vector<int> pc_pools{4, 8, 16, 32};
+    bool pooler = false;  // the DSN is a transaction pooler (pool_options::pooler)
 };
 
 using Worker = std::function<void(Ctx&)>;
@@ -178,6 +179,9 @@ struct Scenario {
 };
 void register_raw(std::vector<Scenario>&);
 void register_v1(std::vector<Scenario>&);
+void register_v2(std::vector<Scenario>&);
+void register_list(std::vector<Scenario>&);
+void register_real(std::vector<Scenario>&);
 
 // pg_bench --summarize FILE: the markdown report of a results CSV on stdout.
 int summarize(const std::string& csv_path);

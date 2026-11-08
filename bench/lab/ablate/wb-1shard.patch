@@ -1,0 +1,11 @@
+--- a/src/writeback.hpp
++++ b/src/writeback.hpp
+@@ -92,7 +92,7 @@
+ // Slots in shards, each with its own lock: no lock is global.
+ class slot_table {
+ public:
+-    static constexpr std::size_t shard_count = 64;
++    static constexpr std::size_t shard_count = 1;
+     static std::size_t shard_of(std::string_view mk);
+ 
+     std::unique_lock<spin_mutex> lock(std::size_t shard) { return std::unique_lock(shards_[shard].m); }

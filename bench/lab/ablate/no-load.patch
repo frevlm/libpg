@@ -1,0 +1,11 @@
+--- a/src/pool.cpp
++++ b/src/pool.cpp
+@@ -217,7 +217,7 @@
+     // Twice the best round trip, at least 1 ms: below that, scheduling noise
+     // on a busy client looks like a slow statement.
+     const std::int64_t limit = std::max<std::int64_t>(2 * best, 1'000'000);
+-    const auto slow = [&](const session* s) { return s->busy.slow(now, best, limit); };
++    const auto slow = [&](const session*) { (void)limit; return false; };
+     auto pick = st.idle.end();
+     for (auto it = st.idle.begin(); it != st.idle.end(); ++it)
+         if (!slow(*it) && (pick == st.idle.end() ||
