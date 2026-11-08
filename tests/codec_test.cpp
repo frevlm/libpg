@@ -232,6 +232,43 @@ TEST_CASE("decimal text helpers") {
     REQUIRE_THROWS_AS(decimal<2>::parse("NaN"), error);
 }
 
+TEST_CASE("decimal to_double") {
+    CHECK(decimal<6>::from_units(3500000).to_double() == 3.5);
+    CHECK(decimal<6>::from_units(-1).to_double() == -0.000001);
+    CHECK(decimal<6>{}.to_double() == 0.0);
+}
+
+TEST_CASE("both 64-bit signed integer types use the int8 codec") {
+    CHECK(codec<long>::param_oid == 20);
+    CHECK(codec<long long>::param_oid == 20);
+    CHECK(codec<long>::accepts(ty(20)));
+    CHECK(codec<long long>::accepts(ty(20)));
+    CHECK_FALSE(codec<long>::accepts(ty(23)));
+    CHECK(enc<long>(-1) == enc<std::int64_t>(-1));
+    CHECK(enc<long long>(-1) == enc<std::int64_t>(-1));
+    CHECK(dec<long>(enc<std::int64_t>(-2), 20) == -2);
+    CHECK(dec<long long>(enc<std::int64_t>(-2), 20) == -2);
+    const auto p = detail::to_param(std::optional<long long>{7});
+    CHECK(p.type == 20);
+    CHECK(p.bytes == enc<std::int64_t>(7));
+}
+
+TEST_CASE("a vector of a binary type is a binary array parameter") {
+    using V = std::vector<std::int32_t>;
+    CHECK(codec<V>::param_oid == 1007);
+    CHECK(codec<std::vector<std::int64_t>>::param_oid == 1016);
+    CHECK(codec<std::vector<decimal<6>>>::param_oid == 1231);
+    CHECK(codec<std::vector<bool>>::param_oid == 1000);
+    CHECK(codec<V>::param_binary);
+    CHECK(enc(V{3, 1, 2}) ==
+          bytes({0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 3, 0, 0, 0, 1,
+                 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 2}));
+    CHECK(enc(V{}) == bytes({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23}));
+    CHECK(enc(std::vector<bool>{true, false}) ==
+          bytes({0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 2, 0, 0, 0, 1,
+                 0, 0, 0, 1, 1, 0, 0, 0, 1, 0}));
+}
+
 TEST_CASE("uuid wire format and text") {
     uuid u = uuid::parse("550E8400-e29b-41d4-A716-446655440000");
     CHECK(u.bytes[0] == 0x55);

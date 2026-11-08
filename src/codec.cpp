@@ -330,6 +330,54 @@ std::string format_scaled(std::int64_t units, int scale) {
     return units < 0 ? "-" + digits : digits;
 }
 
+// ---- arrays --------------------------------------------------------------
+
+oid array_oid(oid element) {
+    switch (element) {
+        case 16: return 1000;
+        case 17: return 1001;
+        case 20: return 1016;
+        case 21: return 1005;
+        case 23: return 1007;
+        case 25: return 1009;
+        case 114: return 199;
+        case 700: return 1021;
+        case 701: return 1022;
+        case 1082: return 1182;
+        case 1184: return 1185;
+        case 1700: return 1231;
+        case 2950: return 2951;
+        case 3802: return 3807;
+    }
+    throw error(error_kind::other, "no array type known for type OID " + std::to_string(element));
+}
+
+void encode_array(oid element, const std::vector<const std::optional<std::string>*>& elems, std::string& out) {
+    bool nulls = false;
+    for (const auto* e : elems) nulls = nulls || !*e;
+    const bool empty = elems.empty();
+    put_int<std::int32_t>(empty ? 0 : 1, out);
+    put_int<std::int32_t>(nulls ? 1 : 0, out);
+    put_int<std::int32_t>(static_cast<std::int32_t>(element), out);
+    if (!empty) {
+        put_int<std::int32_t>(static_cast<std::int32_t>(elems.size()), out);
+        put_int<std::int32_t>(1, out);
+    }
+    for (const auto* e : elems) {
+        put_int<std::int32_t>(*e ? static_cast<std::int32_t>((*e)->size()) : -1, out);
+        if (*e) out += **e;
+    }
+}
+
+param array_param(oid element, const std::vector<const std::optional<std::string>*>& elems) {
+    std::size_t size = 12 + (elems.empty() ? 0 : 8);
+    for (const auto* e : elems) size += 4 + (*e ? (*e)->size() : 0);
+    std::string b;
+    b.reserve(size);
+    encode_array(element, elems, b);
+    return {array_oid(element), true, std::move(b)};
+}
+
 }  // namespace detail
 
 // ---- uuid ----------------------------------------------------------------
@@ -375,7 +423,6 @@ uuid uuid::parse(std::string_view text) {
 // ---- codecs --------------------------------------------------------------
 
 const oid codec<bool>::param_oid = 16;
-const bool codec<bool>::param_binary = true;
 void codec<bool>::encode(const bool& v, std::string& out) { out.push_back(v ? 1 : 0); }
 bool codec<bool>::accepts(const type_desc& t) { return t.id == 16; }
 bool codec<bool>::decode(std::string_view b, const type_desc&) {
@@ -385,7 +432,6 @@ bool codec<bool>::decode(std::string_view b, const type_desc&) {
 
 #define PG_INT_CODEC(T, OID, NAME)                                                           \
     const oid codec<T>::param_oid = OID;                                                     \
-    const bool codec<T>::param_binary = true;                                                \
     void codec<T>::encode(const T& v, std::string& out) { put_int<T>(v, out); }              \
     bool codec<T>::accepts(const type_desc& t) { return t.id == OID; }                       \
     T codec<T>::decode(std::string_view b, const type_desc&) { return get_int<T>(b, NAME); }
@@ -396,7 +442,6 @@ PG_INT_CODEC(std::int64_t, 20, "int8")
 #undef PG_INT_CODEC
 
 const oid codec<float>::param_oid = 700;
-const bool codec<float>::param_binary = true;
 void codec<float>::encode(const float& v, std::string& out) { put_be(std::bit_cast<std::uint32_t>(v), 4, out); }
 bool codec<float>::accepts(const type_desc& t) { return t.id == 700; }
 float codec<float>::decode(std::string_view b, const type_desc&) {
@@ -405,7 +450,6 @@ float codec<float>::decode(std::string_view b, const type_desc&) {
 }
 
 const oid codec<double>::param_oid = 701;
-const bool codec<double>::param_binary = true;
 void codec<double>::encode(const double& v, std::string& out) { put_be(std::bit_cast<std::uint64_t>(v), 8, out); }
 bool codec<double>::accepts(const type_desc& t) { return t.id == 701; }
 double codec<double>::decode(std::string_view b, const type_desc&) {
@@ -414,19 +458,16 @@ double codec<double>::decode(std::string_view b, const type_desc&) {
 }
 
 const oid codec<std::string>::param_oid = 0;
-const bool codec<std::string>::param_binary = false;
 void codec<std::string>::encode(const std::string& v, std::string& out) { out.append(v); }
 bool codec<std::string>::accepts(const type_desc& t) { return t.category == 'S' || t.kind == 'e'; }
 std::string codec<std::string>::decode(std::string_view b, const type_desc&) { return std::string(b); }
 
 const oid codec<numeric>::param_oid = 1700;
-const bool codec<numeric>::param_binary = true;
 void codec<numeric>::encode(const numeric& v, std::string& out) { encode_numeric(v, out); }
 bool codec<numeric>::accepts(const type_desc& t) { return t.id == 1700; }
 numeric codec<numeric>::decode(std::string_view b, const type_desc&) { return decode_numeric(b); }
 
 const oid codec<jsonb>::param_oid = 0;
-const bool codec<jsonb>::param_binary = false;
 void codec<jsonb>::encode(const jsonb& v, std::string& out) { out.append(v.text); }
 bool codec<jsonb>::accepts(const type_desc& t) { return t.id == 114 || t.id == 3802; }
 jsonb codec<jsonb>::decode(std::string_view b, const type_desc& t) {
@@ -436,7 +477,6 @@ jsonb codec<jsonb>::decode(std::string_view b, const type_desc& t) {
 }
 
 const oid codec<uuid>::param_oid = 2950;
-const bool codec<uuid>::param_binary = true;
 void codec<uuid>::encode(const uuid& v, std::string& out) {
     out.append(reinterpret_cast<const char*>(v.bytes.data()), v.bytes.size());
 }
@@ -449,7 +489,6 @@ uuid codec<uuid>::decode(std::string_view b, const type_desc&) {
 }
 
 const oid codec<bytea>::param_oid = 17;
-const bool codec<bytea>::param_binary = true;
 void codec<bytea>::encode(const bytea& v, std::string& out) {
     out.append(reinterpret_cast<const char*>(v.data()), v.size());
 }
@@ -466,7 +505,6 @@ constexpr std::int64_t unix_to_pg_days = 10957;
 }  // namespace
 
 const oid codec<timestamptz>::param_oid = 1184;
-const bool codec<timestamptz>::param_binary = true;
 void codec<timestamptz>::encode(const timestamptz& v, std::string& out) {
     std::int64_t us = v.time_since_epoch().count();
     if (v == timestamptz::max()) {
@@ -490,7 +528,6 @@ timestamptz codec<timestamptz>::decode(std::string_view b, const type_desc&) {
 }
 
 const oid codec<date>::param_oid = 1082;
-const bool codec<date>::param_binary = true;
 void codec<date>::encode(const date& v, std::string& out) {
     std::int32_t days = 0;
     if (v == date::max()) {

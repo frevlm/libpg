@@ -566,6 +566,47 @@ TEST_CASE("every codec type round-trips through the server in binary") {
     REQUIRE(echo(c, std::string("ab"), "char(3)") == "ab ");
 }
 
+TEST_CASE("both 64-bit signed integer types bind and decode as int8") {
+    pg::conn c(db());
+    const long long big = -9000000000000000000LL;
+    REQUIRE(c.query_one<long long>(sql{"SELECT {}::int8", big}) == big);
+    const long other = 1234567890123L;
+    REQUIRE(c.query_one<long>(sql{"SELECT {}::int8", other}) == other);
+    REQUIRE(c.query_one<std::optional<long long>>(sql{"SELECT {}::int8", std::optional<long long>{big}}) == big);
+    REQUIRE(c.query_one<std::optional<long>>(sql{"SELECT NULL::int8"}) == std::nullopt);
+}
+
+TEST_CASE("a vector of a binary type binds as an array parameter") {
+    pg::conn c(db());
+    REQUIRE(c.query<std::int64_t>(sql{"SELECT x FROM unnest({}) AS x ORDER BY x",
+                                      std::vector<std::int64_t>{3, 1, 2}}) ==
+            std::vector<std::int64_t>{1, 2, 3});
+    REQUIRE(c.query<long long>(sql{"SELECT x FROM unnest({}) AS x ORDER BY x",
+                                   std::vector<long long>{3, 1, 2}}) == std::vector<long long>{1, 2, 3});
+    REQUIRE(c.query<std::int32_t>(sql{"SELECT x FROM unnest({}) AS x ORDER BY x",
+                                      std::vector<std::int32_t>{3, 1, 2}}) ==
+            std::vector<std::int32_t>{1, 2, 3});
+    const auto dec = c.query<pg::decimal<6>>(
+        sql{"SELECT x FROM unnest({}) AS x ORDER BY x",
+            std::vector<pg::decimal<6>>{pg::decimal<6>::from_units(2500000), pg::decimal<6>::from_units(-1000000),
+                                        pg::decimal<6>::from_units(0)}});
+    REQUIRE(dec == std::vector<pg::decimal<6>>{pg::decimal<6>::from_units(-1000000), pg::decimal<6>::from_units(0),
+                                               pg::decimal<6>::from_units(2500000)});
+    REQUIRE(c.query<bool>(sql{"SELECT x FROM unnest({}) AS x ORDER BY x",
+                              std::vector<bool>{true, false, true}}) == std::vector<bool>{false, true, true});
+}
+
+TEST_CASE("an empty array parameter matches no rows") {
+    pg::conn c(db());
+    c.exec(sql{"DROP TABLE IF EXISTS array_items"});
+    c.exec(sql{"CREATE TABLE array_items (id int PRIMARY KEY)"});
+    c.exec(sql{"INSERT INTO array_items VALUES (1), (2), (3)"});
+    REQUIRE(c.query<std::int32_t>(sql{"SELECT id FROM array_items WHERE id = ANY({}) ORDER BY id",
+                                      std::vector<std::int32_t>{1, 3}}) == std::vector<std::int32_t>{1, 3});
+    REQUIRE(c.query<std::int32_t>(sql{"SELECT id FROM array_items WHERE id = ANY({})",
+                                      std::vector<std::int32_t>{}}).empty());
+}
+
 TEST_CASE("string-like types read as std::string") {
     pg::conn c(db());
     c.exec(sql{"CREATE EXTENSION IF NOT EXISTS citext"});

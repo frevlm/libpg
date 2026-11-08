@@ -144,6 +144,7 @@ auto n    = c.exec(sql{"DELETE FROM sessions WHERE expires < now()"});
 - 表名、列名这类标识符用 `pg::ident(name)` 插入。
 - 任意字符串当 SQL 文本只有 `pg::unsafe_sql(text)` 这一个入口，专门留给审计时搜索。
 - 列的类型在执行前检查，不匹配时抛错，不会读出乱码。
+- 二进制类型的 `std::vector<T>` 绑定为数组参数，如 `sql{"id = ANY({})", ids}`；`long`、`long long` 都按 int8 绑定。
 
 ### 先发后取：一个请求要查好几样东西
 

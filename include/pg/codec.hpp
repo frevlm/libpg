@@ -54,6 +54,7 @@ struct decimal {
         return v;
     }
     static constexpr decimal from_units(std::int64_t u) { return decimal{u}; }
+    constexpr double to_double() const { return static_cast<double>(units) / static_cast<double>(one()); }
 
     // Parses "-12.5"; more than Scale fractional digits or overflow throws pg::error.
     static decimal parse(std::string_view text);
@@ -90,7 +91,7 @@ using date = std::chrono::sys_days;
 // Conversion between a C++ type and PostgreSQL's wire format. Results are
 // always binary. A specialization provides:
 //
-//   static constexpr oid param_oid;        // OID sent with a parameter; 0 lets the server infer it
+//   static const oid param_oid;            // OID sent with a parameter; 0 lets the server infer it
 //   static constexpr bool param_binary;    // false: encode() writes text format
 //   static void encode(const T&, std::string& out);           // appends the parameter bytes
 //   static bool accepts(const type_desc&);                    // can decode this result column type
@@ -101,29 +102,29 @@ using date = std::chrono::sys_days;
 template <class T>
 struct codec;
 
-#define PG_DECLARE_CODEC(T)                                       \
+#define PG_DECLARE_CODEC(T, BINARY)                               \
     template <>                                                   \
     struct codec<T> {                                             \
         static const oid param_oid;                               \
-        static const bool param_binary;                           \
+        static constexpr bool param_binary = BINARY;              \
         static void encode(const T& v, std::string& out);         \
         static bool accepts(const type_desc& t);                  \
         static T decode(std::string_view b, const type_desc& t);  \
     };
 
-PG_DECLARE_CODEC(bool)
-PG_DECLARE_CODEC(std::int16_t)
-PG_DECLARE_CODEC(std::int32_t)
-PG_DECLARE_CODEC(std::int64_t)
-PG_DECLARE_CODEC(float)
-PG_DECLARE_CODEC(double)
-PG_DECLARE_CODEC(std::string)  // text parameter; accepts category 'S' types and enums
-PG_DECLARE_CODEC(numeric)
-PG_DECLARE_CODEC(jsonb)        // text parameter; accepts json and jsonb
-PG_DECLARE_CODEC(uuid)
-PG_DECLARE_CODEC(bytea)
-PG_DECLARE_CODEC(timestamptz)
-PG_DECLARE_CODEC(date)
+PG_DECLARE_CODEC(bool, true)
+PG_DECLARE_CODEC(std::int16_t, true)
+PG_DECLARE_CODEC(std::int32_t, true)
+PG_DECLARE_CODEC(std::int64_t, true)
+PG_DECLARE_CODEC(float, true)
+PG_DECLARE_CODEC(double, true)
+PG_DECLARE_CODEC(std::string, false)  // text parameter; accepts category 'S' types and enums
+PG_DECLARE_CODEC(numeric, true)
+PG_DECLARE_CODEC(jsonb, false)        // text parameter; accepts json and jsonb
+PG_DECLARE_CODEC(uuid, true)
+PG_DECLARE_CODEC(bytea, true)
+PG_DECLARE_CODEC(timestamptz, true)
+PG_DECLARE_CODEC(date, true)
 #undef PG_DECLARE_CODEC
 
 namespace detail {
@@ -132,6 +133,11 @@ void encode_scaled(std::int64_t units, int scale, std::string& out);
 std::int64_t decode_scaled(std::string_view bytes, int scale);
 std::int64_t parse_scaled(std::string_view text, int scale);
 std::string format_scaled(std::int64_t units, int scale);
+
+// The array type of an element type; throws pg::error for a type it does not know.
+oid array_oid(oid element);
+// Appends a one-dimensional binary array of encoded elements; a null element is SQL NULL.
+void encode_array(oid element, const std::vector<const std::optional<std::string>*>& elems, std::string& out);
 }  // namespace detail
 
 template <int S>
@@ -151,6 +157,51 @@ struct codec<decimal<S>> {
     static bool accepts(const type_desc& t) { return t.id == 1700; }
     // A value with more than S nonzero fractional digits, or out of range, throws pg::error.
     static decimal<S> decode(std::string_view b, const type_desc&) { return {detail::decode_scaled(b, S)}; }
+};
+
+// The other 64-bit signed integer type (long on one platform, long long on the
+// other) shares the int8 codec.
+template <class T>
+    requires(std::is_integral_v<T> && std::is_signed_v<T> && sizeof(T) == 8 && !std::is_same_v<T, std::int64_t>)
+struct codec<T> {
+    static constexpr oid param_oid = 20;
+    static constexpr bool param_binary = true;
+    static void encode(const T& v, std::string& out) {
+        codec<std::int64_t>::encode(static_cast<std::int64_t>(v), out);
+    }
+    static bool accepts(const type_desc& t) { return codec<std::int64_t>::accepts(t); }
+    static T decode(std::string_view b, const type_desc& t) {
+        return static_cast<T>(codec<std::int64_t>::decode(b, t));
+    }
+};
+
+namespace detail {
+template <class T, class = void>
+struct has_binary_codec : std::false_type {};
+template <class T>
+struct has_binary_codec<T, std::void_t<decltype(codec<T>::param_binary)>> : std::bool_constant<codec<T>::param_binary> {
+};
+}  // namespace detail
+
+// A parameter-only codec for a one-dimensional array of a binary element type.
+template <class T>
+    requires detail::has_binary_codec<T>::value
+struct codec<std::vector<T>> {
+    static inline const oid param_oid = detail::array_oid(codec<T>::param_oid);
+    static constexpr bool param_binary = true;
+    static void encode(const std::vector<T>& v, std::string& out) {
+        std::vector<std::optional<std::string>> elems;
+        elems.reserve(v.size());
+        for (const auto& x : v) {
+            std::string b;
+            codec<T>::encode(static_cast<T>(x), b);
+            elems.emplace_back(std::move(b));
+        }
+        std::vector<const std::optional<std::string>*> refs;
+        refs.reserve(elems.size());
+        for (const auto& e : elems) refs.push_back(&e);
+        detail::encode_array(codec<T>::param_oid, refs, out);
+    }
 };
 
 // Parameter-only string types: text format, type inferred by the server.
@@ -194,6 +245,9 @@ struct param {
     std::optional<std::string> bytes;
     bool operator==(const param&) const = default;
 };
+
+// A parameter holding a one-dimensional binary array of those elements.
+param array_param(oid element, const std::vector<const std::optional<std::string>*>& elems);
 
 template <class T>
 param to_param(const T& v) {

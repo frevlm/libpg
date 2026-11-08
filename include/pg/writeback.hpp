@@ -139,9 +139,6 @@ struct wb_delta {
     std::int64_t units;
 };
 
-// The array type of an element type; throws pg::error for a type it does not know.
-oid array_oid(oid element);
-
 // Binary codecs send their own type; text ones send text, cast by the server.
 template <class T>
 wb_element element_of(const T& v) {

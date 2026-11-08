@@ -38,28 +38,6 @@ std::int64_t get_i64(const char* p) {
     return static_cast<std::int64_t>(u);
 }
 
-// A one-dimensional binary array parameter.
-param array_param(oid elem, const std::vector<const std::optional<std::string>*>& elems) {
-    std::string b;
-    bool nulls = false;
-    std::size_t size = 20;
-    for (const auto* e : elems) {
-        nulls = nulls || !*e;
-        size += 4 + (*e ? (*e)->size() : 0);
-    }
-    b.reserve(size);
-    copy_i32(1, b);
-    copy_i32(nulls ? 1 : 0, b);
-    copy_i32(static_cast<std::int32_t>(elem), b);
-    copy_i32(static_cast<std::int32_t>(elems.size()), b);
-    copy_i32(1, b);
-    for (const auto* e : elems) {
-        copy_i32(*e ? static_cast<std::int32_t>((*e)->size()) : -1, b);
-        if (*e) b += **e;
-    }
-    return {array_oid(elem), true, std::move(b)};
-}
-
 param text_array(const std::vector<std::string>& texts) {
     std::vector<std::optional<std::string>> owned(texts.begin(), texts.end());
     std::vector<const std::optional<std::string>*> refs;

@@ -11,16 +11,6 @@
 namespace pg {
 namespace detail {
 
-oid array_oid(oid element) {
-    static constexpr std::pair<oid, oid> known[] = {
-        {16, 1000},   {17, 1001},   {20, 1016},   {21, 1005},   {23, 1007},   {25, 1009},  {700, 1021},
-        {701, 1022},  {1082, 1182}, {1184, 1185}, {1700, 1231}, {2950, 2951}, {114, 199},  {3802, 3807},
-    };
-    for (const auto& [e, a] : known)
-        if (e == element) return a;
-    throw error(error_kind::other, "writeback: no array type known for type OID " + std::to_string(element));
-}
-
 std::string pack_key(const std::vector<std::string>& key) {
     std::string out;
     for (const std::string& k : key) append_key_text(out, k);
