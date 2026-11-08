@@ -689,28 +689,135 @@ query parse_name_line(const std::string& file, const std::string& line) {
     return q;
 }
 
-// Splits a query file into blocks headed by `-- name:` and an optional
-// `-- params:` line; text before the first block is ignored.
+// Splits a query file into blocks headed by `-- name:`; text before the first
+// block is ignored. A `-- params:` line is rejected in favor of :name.
 std::vector<query> parse_query_file(const std::string& file, const std::string& text) {
     std::vector<query> out;
     std::istringstream in(text);
     std::string line;
-    bool header = false;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();  // CRLF files read as LF; the body is otherwise verbatim
         if (line.starts_with("-- name:")) {
             out.push_back(parse_name_line(file, line));
-            header = true;
-        } else if (header && line.starts_with("-- params:")) {
-            for (auto& p : split_words(line.substr(10), ',')) out.back().params.push_back(p);
+        } else if (line.starts_with("-- params:")) {
+            throw std::runtime_error((out.empty() ? file : out.back().where()) +
+                                     ": use :name placeholders instead of -- params:");
         } else if (!out.empty()) {
-            header = false;
             out.back().body += line + "\n";
         }
     }
     for (auto& q : out) {
         q.body = trim(q.body);
         if (q.body.empty()) throw std::runtime_error(q.where() + " has no SQL");
+    }
+    return out;
+}
+
+bool ident_start(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+bool ident_char(char c) { return ident_start(c) || (c >= '0' && c <= '9'); }
+
+// Replaces :name and :'name' with $1..$n, numbering distinct names by first
+// appearance; strings, quoted identifiers, dollar quotes and comments are
+// copied untouched. Throws on bare $n and unusable names.
+std::string rewrite_placeholders(const query& q, std::vector<std::string>& names) {
+    const std::string& b = q.body;
+    std::map<std::string, int> numbers;
+    std::string out;
+    out.reserve(b.size());
+    for (size_t i = 0; i < b.size();) {
+        char ch = b[i];
+        if (ch == '-' && i + 1 < b.size() && b[i + 1] == '-') {
+            auto end = b.find('\n', i);
+            end = end == std::string::npos ? b.size() : end;
+            out.append(b, i, end - i);
+            i = end;
+        } else if (ch == '/' && i + 1 < b.size() && b[i + 1] == '*') {
+            auto end = b.find("*/", i + 2);
+            end = end == std::string::npos ? b.size() : end + 2;
+            out.append(b, i, end - i);
+            i = end;
+        } else if (ch == '\'') {
+            size_t j = i + 1;
+            while (j < b.size()) {
+                if (b[j] == '\'' && j + 1 < b.size() && b[j + 1] == '\'') j += 2;
+                else if (b[j++] == '\'') break;
+            }
+            out.append(b, i, j - i);
+            i = j;
+        } else if ((ch == 'E' || ch == 'e') && i + 1 < b.size() && b[i + 1] == '\'') {
+            size_t j = i + 2;
+            while (j < b.size()) {
+                if (b[j] == '\\' && j + 1 < b.size()) j += 2;
+                else if (b[j] == '\'' && j + 1 < b.size() && b[j + 1] == '\'') j += 2;
+                else if (b[j++] == '\'') break;
+            }
+            out.append(b, i, j - i);
+            i = j;
+        } else if (ch == '"') {
+            size_t j = i + 1;
+            while (j < b.size()) {
+                if (b[j] == '"' && j + 1 < b.size() && b[j + 1] == '"') j += 2;
+                else if (b[j++] == '"') break;
+            }
+            out.append(b, i, j - i);
+            i = j;
+        } else if (ch == '$') {
+            size_t j = i + 1;
+            while (j < b.size() && ident_char(b[j])) ++j;
+            if (j < b.size() && b[j] == '$' && (j == i + 1 || ident_start(b[i + 1]))) {
+                std::string delim = b.substr(i, j - i + 1);
+                auto end = b.find(delim, j + 1);
+                end = end == std::string::npos ? b.size() : end + delim.size();
+                out.append(b, i, end - i);
+                i = end;
+            } else if (i + 1 < b.size() && b[i + 1] >= '0' && b[i + 1] <= '9') {
+                size_t k = i + 2;
+                while (k < b.size() && b[k] >= '0' && b[k] <= '9') ++k;
+                throw std::runtime_error(q.where() + ": write :name instead of " + b.substr(i, k - i));
+            } else {
+                out += ch;
+                ++i;
+            }
+        } else if (ch == ':') {
+            if (i + 1 < b.size() && b[i + 1] == ':') {
+                out += "::";
+                i += 2;
+                continue;
+            }
+            size_t start, end, next;
+            if (i + 1 < b.size() && b[i + 1] == '\'') {
+                start = i + 2;
+                auto close = b.find('\'', start);
+                if (close == std::string::npos) throw std::runtime_error(q.where() + ": unterminated :'name' placeholder");
+                end = close;
+                next = close + 1;
+            } else if (i + 1 < b.size() && ident_start(b[i + 1])) {
+                start = i + 1;
+                end = start;
+                while (end < b.size() && ident_char(b[end])) ++end;
+                next = end;
+            } else {
+                out += ch;
+                ++i;
+                continue;
+            }
+            auto name = b.substr(start, end - start);
+            if (!is_identifier(name) || cxx_keywords().count(name))
+                throw std::runtime_error(q.where() + ": placeholder \"" + name + "\" is not a usable C++ name");
+            auto it = numbers.find(name);
+            if (it == numbers.end()) {
+                names.push_back(name);
+                it = numbers.emplace(name, static_cast<int>(names.size())).first;
+            }
+            out += "$" + std::to_string(it->second);
+            i = next;
+        } else {
+            out += ch;
+            ++i;
+        }
     }
     return out;
 }
@@ -902,8 +1009,8 @@ result_ptr prepare_and_describe(PGconn* c, const query& q) {
 std::vector<member> param_members(session& s, const query& q, const PGresult* d) {
     int n = PQnparams(d);
     if (static_cast<int>(q.params.size()) != n)
-        throw std::runtime_error(q.where() + ": SQL has " + std::to_string(n) + " parameter(s) but \"-- params:\" names " +
-                                 std::to_string(q.params.size()));
+        throw std::runtime_error(q.where() + ": SQL has " + std::to_string(n) + " parameter(s) but " +
+                                 std::to_string(q.params.size()) + " placeholder name(s)");
     std::vector<member> out;
     for (int i = 0; i < n; ++i) {
         auto where = q.where() + " parameter $" + std::to_string(i + 1) + " (" + q.params[i] + ")";
@@ -930,11 +1037,14 @@ std::vector<member> column_members(session& s, const query& q, const PGresult* d
 
 // Parameter, hole and member names must each be distinct C++ names.
 void check_query_names(const typed_query& t) {
+    std::set<std::string> holes(t.holes.begin(), t.holes.end());
     std::set<std::string> args;
-    for (const auto& p : t.params)
+    for (const auto& p : t.params) {
         if (!is_identifier(p.ident) || cxx_keywords().count(p.ident) || !args.insert(p.ident).second)
             throw std::runtime_error(t.q.where() + ": parameter name \"" + p.ident + "\" is not a distinct C++ name");
-    std::set<std::string> holes(t.holes.begin(), t.holes.end());
+        if (holes.count(p.ident))
+            throw std::runtime_error(t.q.where() + ": parameter name \"" + p.ident + "\" clashes with a hole of the same name");
+    }
     for (const auto& h : holes)
         if (cxx_keywords().count(h) || !args.insert(h).second)
             throw std::runtime_error(t.q.where() + ": hole name \"" + h + "\" is not a distinct C++ name");
@@ -949,10 +1059,11 @@ typed_query type_query(session& s, const query& q) {
         throw std::runtime_error("query files need PostgreSQL 16 or newer (EXPLAIN GENERIC_PLAN)");
     typed_query t;
     t.q = q;
-    t.format = format_body(q, t.holes);
-    auto d = prepare_and_describe(s.c, q);
-    t.params = param_members(s, q, d.get());
-    if (q.kind != result_kind::exec) t.columns = column_members(s, q, d.get());
+    t.q.body = rewrite_placeholders(t.q, t.q.params);
+    t.format = format_body(t.q, t.holes);
+    auto d = prepare_and_describe(s.c, t.q);
+    t.params = param_members(s, t.q, d.get());
+    if (q.kind != result_kind::exec) t.columns = column_members(s, t.q, d.get());
     if (q.kind != result_kind::exec && t.columns.empty())
         throw std::runtime_error(q.where() + " returns no columns; annotate it :exec");
     check_query_names(t);
@@ -965,7 +1076,8 @@ std::vector<typed_query> type_queries(session& s, const std::vector<std::string>
     for (const auto& f : files) {
         auto display = std::filesystem::path(f).filename().string();
         for (const auto& q : parse_query_file(display, read_file(f))) {
-            if (!names.insert(q.name).second || !names.insert(q.name + "_row").second)
+            if (!names.insert(q.name).second || !names.insert(q.name + "_row").second ||
+                !names.insert(q.name + "_params").second)
                 throw std::runtime_error(q.where() + ": the name is used twice");
             out.push_back(type_query(s, q));
         }
@@ -981,6 +1093,11 @@ std::string param_decl(const member& p) {
     if (p.type == "std::string") return "std::string_view " + p.ident;
     if (by_value.count(p.type)) return p.type + " " + p.ident;
     return "const " + p.type + "& " + p.ident;
+}
+
+// The type of a parameter inside the generated struct.
+std::string param_member_type(const member& p) {
+    return p.type == "std::string" ? "std::string_view" : p.type;
 }
 
 std::string return_type(const typed_query& t) {
@@ -1021,16 +1138,28 @@ void emit_format(std::ostream& o, const typed_query& t) {
 }
 
 void emit_function(std::ostream& o, const typed_query& t) {
-    std::vector<std::string> decls = {"::pg::conn& conn"};
-    std::vector<std::string> args;
-    for (const auto& p : t.params) {
-        decls.push_back(param_decl(p));
-        args.push_back(p.ident);
-    }
+    std::vector<std::string> holes;
     std::set<std::string> seen;
     for (const auto& h : t.holes)
-        if (seen.insert(h).second) decls.push_back("const ::pg::sql& " + h);
-    args.insert(args.end(), t.holes.begin(), t.holes.end());
+        if (seen.insert(h).second) holes.push_back(h);
+    bool packed = t.params.size() + holes.size() >= 2;
+
+    std::vector<std::string> decls = {"::pg::conn& conn"};
+    std::vector<std::string> args;
+    for (const auto& p : t.params) args.push_back(packed ? "p." + p.ident : p.ident);
+    for (const auto& h : t.holes) args.push_back(packed ? "p." + h : h);
+
+    if (packed) {
+        o << "struct " << t.q.name << "_params {\n";
+        for (const auto& p : t.params) o << "    " << param_member_type(p) << " " << p.ident << ";\n";
+        for (const auto& h : holes) o << "    ::pg::sql " << h << ";\n";
+        o << "};\n";
+        decls.push_back("const " + t.q.name + "_params& p");
+    } else {
+        for (const auto& p : t.params) decls.push_back(param_decl(p));
+        for (const auto& h : holes) decls.push_back("const ::pg::sql& " + h);
+    }
+
     o << "inline " << return_type(t) << " " << t.q.name << "(" << join(decls, ", ") << ") {\n"
       << "    return " << call(t) << "(::pg::sql{\n";
     emit_format(o, t);

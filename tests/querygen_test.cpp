@@ -125,10 +125,10 @@ TEST_CASE(":opt returns the row or nothing; a ? alias makes the member optional"
 TEST_CASE(":many with a hole: empty hole, and a hole whose parameter follows $1") {
     pg::conn c(test_pool());
     auto ann = seed(c);
-    auto all = db::group_members(c, 1, pg::sql{});
+    auto all = db::group_members(c, {.group_id = 1, .filter = pg::sql{}});
     REQUIRE(all.size() == 2);
     CHECK(all[0].title == std::optional<std::string>("admins"));
-    auto admins = db::group_members(c, 1, pg::sql{"AND m.role = {}", "admin"});
+    auto admins = db::group_members(c, {.group_id = 1, .filter = pg::sql{"AND m.role = {}", "admin"}});
     REQUIRE(admins.size() == 1);
     CHECK(admins[0].user_id == ann);
     CHECK(admins[0].role == "admin");
@@ -138,7 +138,7 @@ TEST_CASE(":many with a hole: empty hole, and a hole whose parameter follows $1"
 TEST_CASE("a NOT NULL column on the nullable side of a LEFT JOIN reads NULL") {
     pg::conn c(test_pool());
     seed(c);
-    auto rows = db::group_members(c, 2, pg::sql{});
+    auto rows = db::group_members(c, {.group_id = 2, .filter = pg::sql{}});
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].title == std::nullopt);
 }
@@ -158,18 +158,18 @@ TEST_CASE("jsonb @> in the query body is sent untouched") {
     CHECK(db::users_with_profile(c, pg::jsonb{R"({"team": "y"})"}).size() == 1);
 }
 
-TEST_CASE(":exec returns affected rows; parameters bind by $n, not by position in the body") {
+TEST_CASE(":exec returns affected rows; parameters bind by name, not by position in the body") {
     pg::conn c(test_pool());
     auto ann = seed(c);
-    CHECK(db::set_active(c, ann, false) == 1);
+    CHECK(db::set_active(c, {.active = false, .id = ann}) == 1);
     CHECK(c.query_one<bool>(pg::sql{"SELECT active FROM users WHERE id = {}", ann}) == false);
-    CHECK(db::set_active(c, ann + 1000, true) == 0);
+    CHECK(db::set_active(c, {.active = true, .id = ann + 1000}) == 0);
 }
 
 TEST_CASE("RETURNING old and new values are optional, the plain column is not") {
     pg::conn c(test_pool());
     auto ann = seed(c);
-    db::add_points_row r = db::add_points(c, ann, 5);
+    db::add_points_row r = db::add_points(c, {.delta = 5, .id = ann});
     CHECK(r.before == std::optional<std::int64_t>(0));
     CHECK(r.after == std::optional<std::int64_t>(5));
     CHECK(r.points == 5);
@@ -226,5 +226,5 @@ TEST_CASE("columns with no source row read as NULL") {
     CHECK(totals.back().group_id == std::nullopt);
     for (auto& r : db::left_join_false(c)) CHECK(r.group_id == std::nullopt);
     for (auto& r : db::left_join_pruned(c)) CHECK(r.measurement_id == std::nullopt);
-    CHECK(db::add_group(c, 9, "ops").id == 9);
+    CHECK(db::add_group(c, {.id = 9, .title = "ops"}).id == 9);
 }

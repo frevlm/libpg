@@ -87,7 +87,11 @@ struct group_members_row {
         f(title);
     }
 };
-inline std::vector<group_members_row> group_members(::pg::conn& conn, std::int32_t group_id, const ::pg::sql& filter) {
+struct group_members_params {
+    std::int32_t group_id;
+    ::pg::sql filter;
+};
+inline std::vector<group_members_row> group_members(::pg::conn& conn, const group_members_params& p) {
     return conn.query<group_members_row>(::pg::sql{
         "/*{}*/SELECT m.user_id, m.role, u.username, g.title\n"
         "FROM memberships m\n"
@@ -95,7 +99,7 @@ inline std::vector<group_members_row> group_members(::pg::conn& conn, std::int32
         "LEFT JOIN groups g ON g.id = m.group_id\n"
         "WHERE m.group_id = $1 {}\n"
         "ORDER BY m.user_id;",
-        group_id, filter});
+        p.group_id, p.filter});
 }
 
 // fixture.sql: query user_stats
@@ -137,10 +141,14 @@ inline std::vector<users_with_profile_row> users_with_profile(::pg::conn& conn, 
 }
 
 // fixture.sql: query set_active
-inline std::int64_t set_active(::pg::conn& conn, std::int32_t id, bool active) {
+struct set_active_params {
+    bool active;
+    std::int32_t id;
+};
+inline std::int64_t set_active(::pg::conn& conn, const set_active_params& p) {
     return conn.exec(::pg::sql{
-        "/*{},{}*/UPDATE users SET active = $2 WHERE id = $1;",
-        id, active});
+        "/*{},{}*/UPDATE users SET active = $1 WHERE id = $2;",
+        p.active, p.id});
 }
 
 // fixture.sql: query add_points
@@ -157,11 +165,15 @@ struct add_points_row {
         f(points);
     }
 };
-inline add_points_row add_points(::pg::conn& conn, std::int32_t id, std::int64_t delta) {
+struct add_points_params {
+    std::int64_t delta;
+    std::int32_t id;
+};
+inline add_points_row add_points(::pg::conn& conn, const add_points_params& p) {
     return conn.query_one<add_points_row>(::pg::sql{
-        "/*{},{}*/UPDATE users SET points = points + $2 WHERE id = $1\n"
+        "/*{},{}*/UPDATE users SET points = points + $1 WHERE id = $2\n"
         "RETURNING old.points AS before, new.points AS after, points;",
-        id, delta});
+        p.delta, p.id});
 }
 
 // fixture.sql: query rollup_totals
@@ -230,10 +242,14 @@ struct add_group_row {
         f(title);
     }
 };
-inline add_group_row add_group(::pg::conn& conn, std::int16_t id, std::string_view title) {
+struct add_group_params {
+    std::int16_t id;
+    std::string_view title;
+};
+inline add_group_row add_group(::pg::conn& conn, const add_group_params& p) {
     return conn.query_one<add_group_row>(::pg::sql{
         "/*{},{}*/INSERT INTO groups (id, title) VALUES ($1, $2) RETURNING id, title;",
-        id, title});
+        p.id, p.title});
 }
 
 }

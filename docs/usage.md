@@ -106,13 +106,19 @@ pg::insert_all(c, batch);        // 一条二进制 COPY，整批原子
 
 ```sql
 -- name: user_requests :many
--- params: user_id, since
 SELECT id, time, model, usd FROM requests
-WHERE user_id = $1 AND time >= $2 /*@filter*/
+WHERE user_id = :user_id AND time >= :since /*@filter*/
 ORDER BY id DESC LIMIT 50;
 ```
 
-生成的函数是 `std::vector<db::user_requests_row> db::user_requests(pg::conn&, std::int64_t user_id, pg::timestamptz since, const pg::sql& filter)`。
+参数在 SQL 里就地命名：`:name`，或 psql 的 `:'name'`；`::` 是类型转换，不是占位符。两个以上输入（参数加洞）时生成
+`db::user_requests_params`，调用方按名字填：
+
+```cpp
+auto rows = db::user_requests(c, {.user_id = id, .since = t, .filter = pg::sql{}});
+```
+
+只有 0 或 1 个输入时仍是位置参数。
 
 | 注解 | 返回 | 行数不对时 |
 |---|---|---|
@@ -121,9 +127,13 @@ ORDER BY id DESC LIMIT 50;
 | `:many` | `std::vector<T>` | |
 | `:exec` | 受影响的行数 | |
 
+- 参数名按首次出现编号成 `$1..$n`，同一个名字复用一个参数。字符串、E 字符串、双引号标识符、美元引号和
+  `--`、`/* */` 注释里的冒号不算。
+- 2 个以上输入生成 `<函数名>_params` 结构体，成员按首次出现顺序：参数是 `std::string_view`、标量或其他类型，
+  洞是 `pg::sql`；调用方用指定初始化器。0 或 1 个输入直接按位置传。
 - 每列的可空性按通用执行计划推断。列别名写 `"x!"` 表示强制非空，写 `"x?"` 表示强制可空。
 - `/*@名字*/` 是洞，生成函数里会多一个 `pg::sql` 参数，用来放动态的 WHERE 片段。
-- SQL 文件原样交给服务器执行，可以直接拿到 psql 里调试。
+- SQL 文件保持 psql 写法，`\set name value` 之后可以照原样执行。
 
 ## 6. 语句：动态 SQL
 

@@ -122,6 +122,23 @@ tablegen_expect_test(tablegen_migrations_drift 1
   "${drift_dir}/schema.sql|${CMAKE_CURRENT_BINARY_DIR}/tablegen_drift/mismatch.hpp|--migrations|${drift_dir}/mismatch"
   "-DEXPECT_MESSAGE=only in migrations: public\\.transfers column 4 note text not null")
 
+# Named placeholders: repeated names, casts after a placeholder, colons in
+# literals and comments, and the rejected -- params: and bare $1 forms.
+set(placeholder_queries ${CMAKE_CURRENT_SOURCE_DIR}/queries)
+set(placeholder_out ${CMAKE_CURRENT_BINARY_DIR}/tablegen_placeholders)
+tablegen_expect_test(tablegen_repeated_placeholder 0
+  "${fixture_schema}|${placeholder_out}/repeated.hpp|--override|users.ip=std::string|--queries|${placeholder_queries}/repeated_placeholder.sql|--queries-out|${placeholder_out}/repeated_queries.hpp")
+tablegen_expect_test(tablegen_cast_placeholder 0
+  "${fixture_schema}|${placeholder_out}/cast.hpp|--override|users.ip=std::string|--queries|${placeholder_queries}/cast_placeholder.sql|--queries-out|${placeholder_out}/cast_queries.hpp")
+tablegen_expect_test(tablegen_ignored_placeholders 0
+  "${fixture_schema}|${placeholder_out}/ignored.hpp|--override|users.ip=std::string|--queries|${placeholder_queries}/ignored_placeholders.sql|--queries-out|${placeholder_out}/ignored_queries.hpp")
+tablegen_expect_test(tablegen_params_line 1
+  "${fixture_schema}|${placeholder_out}/params_line.hpp|--override|users.ip=std::string|--queries|${placeholder_queries}/params_line.sql|--queries-out|${placeholder_out}/params_line_queries.hpp"
+  "-DEXPECT_MESSAGE=use :name placeholders instead of -- params:")
+tablegen_expect_test(tablegen_bare_dollar 1
+  "${fixture_schema}|${placeholder_out}/bare_dollar.hpp|--override|users.ip=std::string|--queries|${placeholder_queries}/bare_dollar.sql|--queries-out|${placeholder_out}/bare_dollar_queries.hpp"
+  "-DEXPECT_MESSAGE=write :name instead of")
+
 # Generated query functions run against a database built from fixture_schema.sql.
 libpg_test(querygen_test)
 target_include_directories(querygen_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/generated)

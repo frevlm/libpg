@@ -7,6 +7,8 @@
 时自然忽略，结果的列形状不受影响，所以动态 WHERE 的查询也能拿到生成的行类型——revlm 的 `RequestStore::query`
 和 HHHOJ 的提交列表正需要这个，而 sqlc 讨论多年（#364、#2021、#2060）都没有落地。
 
+`-- params:` 文件头这部分已由 ADR 0026 的 `:name` 占位符取代；生成器会把占位符改写成 `$n`，洞的做法不变。
+
 ## Considered Options
 
 - `@name` 加词法扫描（sqlc 风格）：需要改写 SQL，并与 JSONB 运算符冲突。
