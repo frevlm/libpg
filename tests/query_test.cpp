@@ -40,6 +40,19 @@ void insert_three(pg::conn& c) {
 
 std::int64_t count_items(pg::conn& c) { return c.query_one<std::int64_t>(sql{"SELECT count(*) FROM query_items"}); }
 
+// A read shape without pg_names: it reads positionally.
+struct pair_row {
+    std::string first;
+    std::string second;
+
+    static constexpr std::size_t pg_columns = 2;
+    template <class F>
+    void pg_each(F&& f) {
+        f(first);
+        f(second);
+    }
+};
+
 // A read shape over query_items.
 struct item_row {
     std::int32_t id = 0;
@@ -326,6 +339,13 @@ TEST_CASE("a read shape is decoded column by column") {
     REQUIRE(one.name == "three");
     REQUIRE_THROWS_AS(c.query<item_row>(sql{"SELECT id, name FROM query_items"}), pg::error);
     REQUIRE_THROWS_AS(c.query<item_row>(sql{"SELECT name, id, score FROM query_items"}), pg::error);
+}
+
+TEST_CASE("a read shape without pg_names reads positionally") {
+    pg::conn c(db());
+    const auto r = c.query_one<pair_row>(sql{"SELECT 'x' AS alpha, 'y' AS beta"});
+    REQUIRE(r.first == "x");
+    REQUIRE(r.second == "y");
 }
 
 TEST_CASE("insert writes DEFAULT for unset fields and NULL for empty optionals") {

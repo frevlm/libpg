@@ -24,6 +24,7 @@ struct type_desc {
     std::string_view name;  // pg_type.typname
     char category = 0;      // pg_type.typcategory ('S' string, 'N' numeric, ...)
     char kind = 0;          // pg_type.typtype ('b' base, 'e' enum, 'd' domain, ...)
+    std::string_view column;  // the result column's name; empty for a type description
 };
 
 // Arbitrary precision numeric in PostgreSQL's own form: base-10000 digits,

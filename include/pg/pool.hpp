@@ -351,6 +351,11 @@ std::optional<std::string> check_one(std::span<const type_desc> cols, std::size_
     return column_mismatch(i, cols[i]);
 }
 
+template <class R, class = void>
+struct has_pg_names : std::false_type {};
+template <class R>
+struct has_pg_names<R, std::void_t<decltype(R::pg_names)>> : std::true_type {};
+
 template <class R>
 std::optional<std::string> check_shape(std::span<const type_desc> cols) {
     if (cols.size() != R::pg_columns)
@@ -360,6 +365,13 @@ std::optional<std::string> check_shape(std::span<const type_desc> cols) {
     std::size_t i = 0;
     std::optional<std::string> bad;
     probe.pg_each([&](auto& m) {
+        if (!bad) {
+            if constexpr (has_pg_names<R>::value) {
+                if (cols[i].column != R::pg_names[i])
+                    bad = "column " + std::to_string(i + 1) + " is \"" + std::string(cols[i].column) +
+                          "\", the row shape expects \"" + std::string(R::pg_names[i]) + "\"";
+            }
+        }
         if (!bad) bad = check_one<std::remove_cvref_t<decltype(m)>>(cols, i);
         ++i;
     });

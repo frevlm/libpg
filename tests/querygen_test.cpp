@@ -175,6 +175,39 @@ TEST_CASE("RETURNING old and new values are optional, the plain column is not") 
     CHECK(r.points == 5);
 }
 
+TEST_CASE("a generated read shape rejects swapped same-typed columns and accepts the right order") {
+    pg::conn c(test_pool());
+    seed(c);
+    const pg::sql swapped{
+        "SELECT m.user_id, u.username, m.role, g.title FROM memberships m "
+        "JOIN users u ON u.id = m.user_id JOIN groups g ON g.id = m.group_id "
+        "WHERE m.group_id = 1 ORDER BY m.user_id"};
+    try {
+        c.query<db::group_members_row>(swapped);
+        FAIL("swapped text columns were decoded");
+    } catch (const pg::error& e) {
+        REQUIRE(std::string(e.what()) == "column 2 is \"username\", the row shape expects \"role\"");
+    }
+    const pg::sql right{
+        "SELECT m.user_id, m.role, u.username, g.title FROM memberships m "
+        "JOIN users u ON u.id = m.user_id JOIN groups g ON g.id = m.group_id "
+        "WHERE m.group_id = 1 ORDER BY m.user_id"};
+    const auto rows = c.query<db::group_members_row>(right);
+    REQUIRE(rows.size() == 2);
+    REQUIRE(rows[0].role == "admin");
+    REQUIRE(rows[0].username == std::optional<std::string>("ann"));
+}
+
+TEST_CASE("send checks a generated read shape's column names too") {
+    pg::conn c(test_pool());
+    seed(c);
+    const pg::sql swapped{
+        "SELECT m.user_id, u.username, m.role, g.title FROM memberships m "
+        "JOIN users u ON u.id = m.user_id JOIN groups g ON g.id = m.group_id "
+        "WHERE m.group_id = 1 ORDER BY m.user_id"};
+    REQUIRE_THROWS_AS(c.send<db::group_members_row>(swapped), pg::error);
+}
+
 TEST_CASE("a table's read shape decodes SELECT *") {
     pg::conn c(test_pool());
     auto ann = seed(c);

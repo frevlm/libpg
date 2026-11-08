@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -138,6 +139,17 @@ poll_t poll(pg::conn& c, int judger) {
     return p;
 }
 
+// A read shape whose pg_names do not match the root's column.
+struct token_shape {
+    std::string token;
+    static constexpr std::size_t pg_columns = 1;
+    static constexpr std::array<std::string_view, 1> pg_names{"token"};
+    template <class F>
+    void pg_each(F&& f) {
+        f(token);
+    }
+};
+
 template <class F>
 auto on(pg::pool& p, F&& f) {
     pg::conn c(p);
@@ -172,6 +184,21 @@ TEST_CASE("prefetched reads return what the reads return without prefetch") {
     const pg::pool_stats s = p.stats();
     CHECK(s.prefetch_plans >= warmed.prefetch_plans + 17);
     CHECK(s.prefetch_hits > warmed.prefetch_hits);
+}
+
+TEST_CASE("a prefetched read checks the row shape's column names") {
+    seed();
+    pg::pool p(opts(true));
+    warm(p);
+    const pg::pool_stats before = p.stats();
+    pg::conn c(p);
+    try {
+        c.query<token_shape>(sql{"SELECT username FROM pf_sessions WHERE token = {}", "tok1"});
+        FAIL("a wrongly named shape was accepted");
+    } catch (const pg::error& e) {
+        CHECK(std::string(e.what()) == "column 1 is \"username\", the row shape expects \"token\"");
+    }
+    CHECK(p.stats().prefetch_plans > before.prefetch_plans);
 }
 
 TEST_CASE("a prefetched result answers one read; the same read again executes") {

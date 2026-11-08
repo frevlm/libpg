@@ -173,7 +173,9 @@ void put_copy_member(const M& m, const copy_target& t, std::string& out) {
 
 // A struct one result row decodes into, column by column:
 //   static constexpr std::size_t pg_columns = N;
+//   static constexpr std::array<std::string_view, N> pg_names;  // optional: the column names
 //   template <class F> void pg_each(F&& f);   // f(member) for each member in column order
+// With pg_names, a result column whose name differs is rejected before decoding.
 template <class T>
 concept read_shape = std::is_default_constructible_v<T> && requires(T& t) {
     { T::pg_columns } -> std::convertible_to<std::size_t>;

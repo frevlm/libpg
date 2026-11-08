@@ -475,6 +475,7 @@ const column& find_column(const table& t, const std::string& name) {
 struct member {
     std::string ident;
     std::string type;
+    std::string column;  // the result column's name, for a read shape member
 };
 
 std::string optional_of(const std::string& cxx, bool nullable) {
@@ -497,10 +498,20 @@ void emit_each(std::ostream& o, const std::vector<member>& ms, const char* quali
     o << "    }\n";
 }
 
+std::string names_array(const std::string& member_name, const std::vector<std::string>& cols) {
+    std::vector<std::string> q;
+    for (const auto& n : cols) q.push_back(quote_literal(n));
+    return "std::array<std::string_view, " + std::to_string(cols.size()) + "> " + member_name + "{" + join(q, ", ") + "}";
+}
+
 void emit_read_shape(std::ostream& o, const std::string& name, const std::vector<member>& ms) {
+    std::vector<std::string> names;
+    names.reserve(ms.size());
+    for (const auto& m : ms) names.push_back(m.column);
     o << "struct " << name << " {\n";
     emit_members(o, ms);
     o << "    static constexpr std::size_t pg_columns = " << ms.size() << ";\n";
+    o << "    static constexpr " << names_array("pg_names", names) << ";\n";
     emit_each(o, ms, "");
     o << "};\n";
 }
@@ -511,12 +522,6 @@ std::string key_types(const table& t, const std::vector<std::string>& cols) {
     std::vector<std::string> types;
     for (const auto& n : cols) types.push_back(find_column(t, n).cxx);
     return "std::tuple<" + join(types, ", ") + ">";
-}
-
-std::string names_array(const std::string& member_name, const std::vector<std::string>& cols) {
-    std::vector<std::string> q;
-    for (const auto& n : cols) q.push_back(quote_literal(n));
-    return "std::array<std::string_view, " + std::to_string(cols.size()) + "> " + member_name + "{" + join(q, ", ") + "}";
 }
 
 void emit_table_struct(std::ostream& o, const table& t) {
@@ -554,7 +559,7 @@ void emit_locator(std::ostream& o, const table& t, const std::vector<std::string
 
 std::vector<member> read_members(const table& t) {
     std::vector<member> ms;
-    for (const auto& c : t.columns) ms.push_back({c.ident, optional_of(c.cxx, c.nullable)});
+    for (const auto& c : t.columns) ms.push_back({c.ident, optional_of(c.cxx, c.nullable), c.name});
     return ms;
 }
 
@@ -572,7 +577,7 @@ void emit_write_shape(std::ostream& o, const table& t) {
     std::vector<std::string> names;
     for (const auto& c : t.columns) {
         if (!writable(c)) continue;
-        ms.push_back({c.ident, write_type(c)});
+        ms.push_back({c.ident, write_type(c), {}});
         names.push_back(c.name);
     }
     o << "struct write {\n"
@@ -832,6 +837,7 @@ std::optional<origin> column_origin(session& s, Oid table_oid, int attnum) {
 
 // A result column as described by the server.
 struct result_column {
+    std::string label;            // as the server reports it
     std::string name;             // without a `!` / `?` suffix
     std::optional<bool> forced;   // nullable as the suffix says
     std::optional<origin> from;   // table column it reads, if any
@@ -841,7 +847,8 @@ struct result_column {
 
 result_column describe_column(session& s, const PGresult* d, int i) {
     result_column rc;
-    rc.name = PQfname(d, i);
+    rc.label = PQfname(d, i);
+    rc.name = rc.label;
     if (rc.name.size() > 1 && (rc.name.back() == '!' || rc.name.back() == '?')) {
         rc.forced = rc.name.back() == '?';
         rc.name.pop_back();
@@ -901,7 +908,7 @@ std::vector<member> param_members(session& s, const query& q, const PGresult* d)
     for (int i = 0; i < n; ++i) {
         auto where = q.where() + " parameter $" + std::to_string(i + 1) + " (" + q.params[i] + ")";
         auto type = s.mapper.map_or_report(s.types.resolve(PQparamtype(d, i), -1), "", where);
-        out.push_back({q.params[i], type});
+        out.push_back({q.params[i], type, {}});
     }
     return out;
 }
@@ -916,7 +923,7 @@ std::vector<member> column_members(session& s, const query& q, const PGresult* d
         auto where = q.where() + " column " + c.name;
         if (c.name == "?column?") s.mapper.report(q.where() + ": result column " + std::to_string(i + 1) + " needs a name (AS ...)");
         auto type = s.mapper.map_or_report(c.type, c.from ? c.from->key : "", where);
-        out.push_back({column_ident(c.name), optional_of(type, nullable[i])});
+        out.push_back({column_ident(c.name), optional_of(type, nullable[i]), c.label});
     }
     return out;
 }
@@ -1036,7 +1043,7 @@ std::string render_queries(const std::vector<typed_query>& qs, const std::string
     for (const auto& f : files) names.push_back(std::filesystem::path(f).filename().string());
     std::ostringstream o;
     o << generated_by(names.empty() ? "no query files" : join(names, ", "))
-      << "#include <cstddef>\n#include <cstdint>\n#include <optional>\n#include <string>\n"
+      << "#include <array>\n#include <cstddef>\n#include <cstdint>\n#include <optional>\n#include <string>\n"
       << "#include <string_view>\n#include <vector>\n\n"
       << "#include \"pg/codec.hpp\"\n#include \"pg/pool.hpp\"\n#include \"pg/sql.hpp\"\n\n"
       << "// Each statement starts with a comment holding its parameters, so they are\n"

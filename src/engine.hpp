@@ -33,8 +33,9 @@ namespace pg::detail {
 struct prepared {
     std::string name;
     std::vector<oid> columns;
-    std::vector<oid> param_types;      // the parameter types the server resolved
-    std::vector<type_desc> described;  // the result column types, once all are known; guarded by session::mu
+    std::vector<std::string> column_names;  // the result columns' names, in order
+    std::vector<oid> param_types;           // the parameter types the server resolved
+    std::vector<type_desc> described;  // the result column types, once all are known; views column_names; guarded by session::mu
 };
 
 // Cache key (statement text and parameter types) -> prepared statement, least

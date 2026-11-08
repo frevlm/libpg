@@ -26,6 +26,7 @@ struct id {
 struct row {
     std::int32_t id{};
     static constexpr std::size_t pg_columns = 1;
+    static constexpr std::array<std::string_view, 1> pg_names{"id"};
     template <class F>
     void pg_each(F&& f) {
         f(id);
@@ -84,6 +85,7 @@ struct row {
     std::optional<std::string> name{};
     std::int64_t seq{};
     static constexpr std::size_t pg_columns = 6;
+    static constexpr std::array<std::string_view, 6> pg_names{"ticket", "type", "time", "class", "name", "seq"};
     template <class F>
     void pg_each(F&& f) {
         f(ticket);
@@ -135,6 +137,7 @@ struct row {
     std::int16_t id{};
     std::string title{};
     static constexpr std::size_t pg_columns = 2;
+    static constexpr std::array<std::string_view, 2> pg_names{"id", "title"};
     template <class F>
     void pg_each(F&& f) {
         f(id);
@@ -180,6 +183,7 @@ struct row {
     ::pg::timestamptz day{};
     std::optional<double> val{};
     static constexpr std::size_t pg_columns = 3;
+    static constexpr std::array<std::string_view, 3> pg_names{"id", "day", "val"};
     template <class F>
     void pg_each(F&& f) {
         f(id);
@@ -240,6 +244,7 @@ struct row {
     std::string role{};
     std::optional<::pg::timestamptz> since{};
     static constexpr std::size_t pg_columns = 4;
+    static constexpr std::array<std::string_view, 4> pg_names{"user_id", "group_id", "role", "since"};
     template <class F>
     void pg_each(F&& f) {
         f(user_id);
@@ -297,6 +302,7 @@ struct row {
     std::int32_t soft{};
     std::optional<::pg::decimal<2>> cost{};
     static constexpr std::size_t pg_columns = 4;
+    static constexpr std::array<std::string_view, 4> pg_names{"id", "limit_", "soft", "cost"};
     template <class F>
     void pg_each(F&& f) {
         f(id);
@@ -462,6 +468,7 @@ struct row {
     std::optional<std::string> mood{};
     std::optional<std::int32_t> level{};
     static constexpr std::size_t pg_columns = 21;
+    static constexpr std::array<std::string_view, 21> pg_names{"id", "username", "email", "nick", "active", "rank", "points", "score", "balance", "profile", "raw", "joined", "birthday", "ratio", "ip", "uid", "avatar", "stake", "big", "mood", "level"};
     template <class F>
     void pg_each(F&& f) {
         f(id);

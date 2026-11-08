@@ -587,13 +587,13 @@ constexpr int type_index(oid id) {
 
 const type_desc* builtin_type(oid id) {
     static const type_desc table[] = {
-        {16, "bool", 'B', 'b'},      {17, "bytea", 'U', 'b'},   {19, "name", 'S', 'b'},
-        {20, "int8", 'N', 'b'},      {21, "int2", 'N', 'b'},    {23, "int4", 'N', 'b'},
-        {25, "text", 'S', 'b'},      {26, "oid", 'N', 'b'},     {114, "json", 'U', 'b'},
-        {700, "float4", 'N', 'b'},   {701, "float8", 'N', 'b'}, {705, "unknown", 'X', 'p'},
-        {1042, "bpchar", 'S', 'b'},  {1043, "varchar", 'S', 'b'}, {1082, "date", 'D', 'b'},
-        {1114, "timestamp", 'D', 'b'}, {1184, "timestamptz", 'D', 'b'}, {1700, "numeric", 'N', 'b'},
-        {2950, "uuid", 'U', 'b'},    {3802, "jsonb", 'U', 'b'},
+        {16, "bool", 'B', 'b', {}},      {17, "bytea", 'U', 'b', {}},   {19, "name", 'S', 'b', {}},
+        {20, "int8", 'N', 'b', {}},      {21, "int2", 'N', 'b', {}},    {23, "int4", 'N', 'b', {}},
+        {25, "text", 'S', 'b', {}},      {26, "oid", 'N', 'b', {}},     {114, "json", 'U', 'b', {}},
+        {700, "float4", 'N', 'b', {}},   {701, "float8", 'N', 'b', {}}, {705, "unknown", 'X', 'p', {}},
+        {1042, "bpchar", 'S', 'b', {}},  {1043, "varchar", 'S', 'b', {}}, {1082, "date", 'D', 'b', {}},
+        {1114, "timestamp", 'D', 'b', {}}, {1184, "timestamptz", 'D', 'b', {}}, {1700, "numeric", 'N', 'b', {}},
+        {2950, "uuid", 'U', 'b', {}},    {3802, "jsonb", 'U', 'b', {}},
     };
     const int i = type_index(id);
     return i < 0 ? nullptr : &table[i];

@@ -361,14 +361,15 @@ bool has_column_source(const planned& p) {
 std::vector<col_info> info_of(std::span<const type_desc> cols) {
     std::vector<col_info> out;
     out.reserve(cols.size());
-    for (const type_desc& t : cols) out.push_back({t.id, std::string(t.name), t.category, t.kind});
+    for (const type_desc& t : cols)
+        out.push_back({t.id, std::string(t.name), t.category, t.kind, std::string(t.column)});
     return out;
 }
 
 bool same_types(const std::vector<col_info>& a, std::span<const type_desc> b) {
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i)
-        if (a[i].id != b[i].id) return false;
+        if (a[i].id != b[i].id || a[i].column != b[i].column) return false;
     return true;
 }
 
@@ -764,7 +765,7 @@ batch_text text_of(const sql& s) {
 }
 
 void add_types(std::vector<type_desc>& out, const std::vector<col_info>& types) {
-    for (const col_info& c : types) out.push_back({c.id, c.name, c.category, c.kind});
+    for (const col_info& c : types) out.push_back({c.id, c.name, c.category, c.kind, c.column});
 }
 
 // The result columns a statement must return, from the observed column types.
@@ -789,7 +790,7 @@ void expect(prefetch_plan& pl, plan_stmt& st) {
         case plan_stmt::partitioned:
             for (int k : st.keys) {
                 const col_info& c = parent[static_cast<std::size_t>(k)];
-                st.cols.push_back({c.id, c.name, c.category, c.kind});
+                st.cols.push_back({c.id, c.name, c.category, c.kind, c.column});
             }
             members();
             break;

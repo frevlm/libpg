@@ -48,7 +48,7 @@ void type_cache::add(oid id, std::string name, char category, char kind) {
     auto [it, fresh] = types_.try_emplace(id);
     if (!fresh) return;
     it->second.name = std::move(name);
-    it->second.d = type_desc{id, it->second.name, category, kind};
+    it->second.d = type_desc{id, it->second.name, category, kind, {}};
 }
 
 std::string conn_message(PGconn* c) {
@@ -434,7 +434,11 @@ void remember(session& s, op& w, const step& st, const PGresult* r) {
     auto p = std::make_shared<prepared>();
     p->name = st.name;
     p->columns.reserve(static_cast<std::size_t>(PQnfields(r)));
-    for (int i = 0; i < PQnfields(r); ++i) p->columns.push_back(PQftype(r, i));
+    p->column_names.reserve(static_cast<std::size_t>(PQnfields(r)));
+    for (int i = 0; i < PQnfields(r); ++i) {
+        p->columns.push_back(PQftype(r, i));
+        p->column_names.emplace_back(PQfname(r, i));
+    }
     p->param_types.reserve(static_cast<std::size_t>(PQnparams(r)));
     for (int i = 0; i < PQnparams(r); ++i) p->param_types.push_back(PQparamtype(r, i));
     if (auto evicted = s.cache.add(std::move(w.keys[st.stmt]), std::move(p))) s.closes.push_back(std::move(*evicted));
@@ -532,6 +536,13 @@ const type_desc* known_type(const session& s, oid id) {
     return s.types.find(id);
 }
 
+// Descriptions whose column names are not owned by a cached prepared statement:
+// `statement` keeps the names type_desc::column views alive.
+struct described_keep {
+    std::shared_ptr<const prepared> statement;
+    std::vector<type_desc> cols;
+};
+
 // The column types of every checked statement, asking the server about
 // types it did not describe to this session before, and remembering them.
 void describe_columns(std::unique_lock<std::mutex>& lk, session& s, op& w,
@@ -558,19 +569,22 @@ void describe_columns(std::unique_lock<std::mutex>& lk, session& s, op& w,
         std::vector<type_desc> built;
         built.reserve(p.columns.size());
         bool all = true;
-        for (oid id : p.columns) {
-            const type_desc* t = known_type(s, id);
+        for (std::size_t k = 0; k < p.columns.size(); ++k) {
+            const type_desc* t = known_type(s, p.columns[k]);
             if (!t) {
                 all = false;
                 continue;
             }
-            built.push_back(*t);
+            type_desc d = *t;
+            if (k < p.column_names.size()) d.column = p.column_names[k];
+            built.push_back(d);
         }
         if (all) {
             p.described = std::move(built);
             w.o.columns[i] = column_desc(preps[i], &p.described);
         } else {
-            w.o.columns[i] = std::make_shared<const std::vector<type_desc>>(std::move(built));
+            auto keep = std::make_shared<described_keep>(described_keep{preps[i], std::move(built)});
+            w.o.columns[i] = column_desc(keep, &keep->cols);
         }
     }
 }

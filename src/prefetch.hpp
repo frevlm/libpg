@@ -28,12 +28,14 @@ struct source {
     int index = 0;  // root_param: the root's parameter; column: the parent's column
 };
 
-// A result column's type as observed; type_desc views of it point into `name`.
+// A result column's type as observed; type_desc views of it point into `name`
+// and `column`.
 struct col_info {
     oid id = 0;
     std::string name;
     char category = 0;
     char kind = 0;
+    std::string column;  // the result column's name
 };
 
 // A follower a plan fetches: a read seen after the root with every parameter sourced.
