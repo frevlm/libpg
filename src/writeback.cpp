@@ -7,6 +7,9 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <set>
+
+#include "libpg_schema.hpp"
 
 namespace pg {
 namespace detail {
@@ -248,6 +251,28 @@ void inject_fault(writeback& w, wb_fault f) { w.st_->fault.store(static_cast<int
 
 }  // namespace detail
 
+namespace {
+
+// The column's four triggers must exist and run libpg.watch_notify.
+void check_watched(pool& p, const detail::counter_def& d) {
+    const std::string base = detail::watch_trigger_base(d.table, d.column);
+    std::set<std::string> names;
+    {
+        conn c(p);
+        for (std::string& name : c.query<std::string>(
+                 sql{"SELECT t.tgname::text FROM pg_trigger t WHERE t.tgrelid = to_regclass({}) "
+                     "AND t.tgfoid = to_regprocedure('libpg.watch_notify()')",
+                     detail::quote_ident(d.table)}))
+            names.insert(std::move(name));
+    }
+    for (const char* suffix : {"_ins", "_upd", "_del", "_trn"})
+        if (!names.contains(base + suffix))
+            throw error(error_kind::other, "writeback: " + std::string(d.table) + "." + std::string(d.column) +
+                                               " is not watched; add pg::watch<Col>() to migrate_options::watched and run pg::migrate");
+}
+
+}  // namespace
+
 writeback::writeback(pool& p, writeback_options o) : st_(std::make_unique<detail::wb_state>(p, std::move(o))) {
     if (pipe(st_->wake_pipe) != 0) throw error(error_kind::other, "writeback: pipe() failed");
     st_->writer = std::thread(detail::writer_loop, std::ref(*st_));
@@ -275,6 +300,7 @@ writeback::~writeback() {
 
 void writeback::watch_counter(const detail::counter_def& d) {
     detail::wb_state& w = *st_;
+    check_watched(w.p, d);
     w.counter_for(d).watched.store(true);
     std::lock_guard lk(w.reg_m);
     if (!w.listener.joinable()) w.listener = std::thread(detail::listen_loop, std::ref(w));

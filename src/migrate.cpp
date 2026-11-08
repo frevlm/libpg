@@ -150,7 +150,7 @@ std::vector<trigger_spec> triggers_of(conn& c, const watched_column& w) {
         args_sql += ", " + literal(k);
         args_raw += k + '\0';
     }
-    const std::string base = "libpg_w_" + detail::sha256_hex(w.table + "." + w.column).substr(0, 16);
+    const std::string base = detail::watch_trigger_base(w.table, w.column);
     const std::string hex = hex_of(args_raw);
     return {{base + "_ins", *table, "INSERT", "REFERENCING NEW TABLE AS libpg_new", args_sql, hex},
             {base + "_upd", *table, "UPDATE", "REFERENCING OLD TABLE AS libpg_old NEW TABLE AS libpg_new", args_sql, hex},

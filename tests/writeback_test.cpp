@@ -40,6 +40,11 @@ struct points {
     using pg_type = std::int64_t;
     static constexpr std::string_view pg_name = "points";
 };
+struct balance_id {
+    using pg_table = balances;
+    using pg_type = std::int64_t;
+    static constexpr std::string_view pg_name = "id";
+};
 struct stock {
     static constexpr std::string_view name = "wb_stock";
     using key = std::tuple<std::int32_t, std::string>;
@@ -502,4 +507,30 @@ TEST_CASE("a TRUNCATE reconciles every loaded slot of the counter", "[writeback]
     run(sql{"TRUNCATE wb_stock"});
     REQUIRE(eventually([&] { return wb.stats().reconciled >= 1; }));
     REQUIRE_THROWS_AS(wb.get<qty>(1, "a b"), pg::not_found);
+}
+
+TEST_CASE("watch on a column migrate did not register throws", "[writeback]") {
+    reset();
+    pg::writeback wb(db(), manual());
+    try {
+        wb.watch<balance_id>();
+        FAIL("watch did not throw");
+    } catch (const pg::error& e) {
+        CHECK(e.kind == pg::error_kind::other);
+        CHECK(std::string(e.what()) ==
+              "writeback: wb_balances.id is not watched; add pg::watch<Col>() to migrate_options::watched and run pg::migrate");
+    }
+}
+
+TEST_CASE("watch before any migrate throws", "[writeback]") {
+    run(sql{"DROP SCHEMA IF EXISTS libpg CASCADE"});
+    pg::writeback wb(db(), manual());
+    try {
+        wb.watch<amount>();
+        FAIL("watch did not throw");
+    } catch (const pg::error& e) {
+        CHECK(e.kind == pg::error_kind::other);
+        CHECK(std::string(e.what()) ==
+              "writeback: wb_balances.amount is not watched; add pg::watch<Col>() to migrate_options::watched and run pg::migrate");
+    }
 }

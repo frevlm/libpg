@@ -1,9 +1,14 @@
 // The objects libpg keeps in the database, in the `libpg` schema (ADR 0017).
 #pragma once
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace pg::detail {
+
+// The shared prefix of a watched column's four trigger names:
+// libpg_w_<first 16 hex of sha256(table || '.' || column)>.
+std::string watch_trigger_base(std::string_view table, std::string_view column);
 
 // Advisory lock key that serializes migrations: "libpg" in ASCII (0x6c69627067).
 // Taken with pg_advisory_xact_lock by pg::migrate.

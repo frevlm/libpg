@@ -1,6 +1,12 @@
 #include "libpg_schema.hpp"
 
+#include "sha256.hpp"
+
 namespace pg::detail {
+
+std::string watch_trigger_base(std::string_view table, std::string_view column) {
+    return "libpg_w_" + sha256_hex(std::string(table) + "." + std::string(column)).substr(0, 16);
+}
 
 std::string_view libpg_schema_sql() {
     static constexpr std::string_view sql = R"SQL(
