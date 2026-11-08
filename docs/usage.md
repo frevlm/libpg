@@ -24,8 +24,8 @@ pg_tablegen postgresql://user@host/postgres schema.sql db_tables.hpp --namespace
 
 它在服务器上建一个临时库，执行 schema，读出类型，然后删掉这个库。每张表 `t` 生成以下内容：
 
-- `db::t::<列名>`：列标签，携带表名、列名和 C++ 类型，例如 `db::users::balance`。
-- `db::t::row`：读形状，对应 `SELECT *` 读出的一行。
+- `db::t::<列名>`：列标签，成员 `pg_table`、`pg_type`、`pg_name` 分别是表、列的 C++ 类型和列名，例如 `db::users::balance`。
+- `db::t::row`：读形状，对应 `SELECT *` 读出的一行；带列名 `pg_names`，结果列名对不上时在解码前抛错。
 - `db::t::write`：写形状。有 DEFAULT 的列是 `pg::field<T>`，不设置就写 DEFAULT。可空的列是 `std::optional<T>`。
 - 唯一约束对应的定位器。
 
@@ -153,7 +153,7 @@ auto n    = c.exec(sql{"DELETE FROM sessions WHERE expires < now()"});
 - 语句可以嵌套：`sql{"... WHERE {}", other_sql}`。
 - 表名、列名这类标识符用 `pg::ident(name)` 插入。
 - 任意字符串当 SQL 文本只有 `pg::unsafe_sql(text)` 这一个入口，专门留给审计时搜索。
-- 列的类型在执行前检查，不匹配时抛错，不会读出乱码。
+- 列的类型在执行前检查，不匹配时抛错，不会读出乱码；生成的行类型还按列名 `pg_names` 检查，列名对不上同样在解码前抛错。
 - 二进制类型的 `std::vector<T>` 绑定为数组参数，如 `sql{"id = ANY({})", ids}`；`long`、`long long` 都按 int8 绑定。
 
 ### 先发后取：一个请求要查好几样东西

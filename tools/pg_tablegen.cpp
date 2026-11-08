@@ -719,6 +719,38 @@ bool ident_start(char c) {
 
 bool ident_char(char c) { return ident_start(c) || (c >= '0' && c <= '9'); }
 
+// End of the quoted run that opens at `start` (just past the opening quote).
+// A doubled quote is an escaped quote; with `backslash`, a backslash escapes
+// the next character.
+size_t quoted_end(const std::string& b, size_t start, char quote, bool backslash) {
+    size_t j = start;
+    while (j < b.size()) {
+        if (backslash && b[j] == '\\' && j + 1 < b.size()) j += 2;
+        else if (b[j] == quote && j + 1 < b.size() && b[j + 1] == quote) j += 2;
+        else if (b[j++] == quote) break;
+    }
+    return j;
+}
+
+// End of a `--` or `/* */` comment or a `$tag$` string starting at i, else npos.
+size_t opaque_end(const std::string& b, size_t i) {
+    if (b[i] == '-' && i + 1 < b.size() && b[i + 1] == '-') {
+        auto nl = b.find('\n', i);
+        return nl == std::string::npos ? b.size() : nl;
+    }
+    if (b[i] == '/' && i + 1 < b.size() && b[i + 1] == '*') {
+        auto end = b.find("*/", i + 2);
+        return end == std::string::npos ? b.size() : end + 2;
+    }
+    if (b[i] != '$') return std::string::npos;
+    size_t j = i + 1;
+    while (j < b.size() && ident_char(b[j])) ++j;
+    if (j >= b.size() || b[j] != '$' || (j > i + 1 && !ident_start(b[i + 1]))) return std::string::npos;
+    std::string delim = b.substr(i, j - i + 1);
+    auto end = b.find(delim, j + 1);
+    return end == std::string::npos ? b.size() : end + delim.size();
+}
+
 // Replaces :name and :'name' with $1..$n, numbering distinct names by first
 // appearance; strings, quoted identifiers, dollar quotes and comments are
 // copied untouched. Throws on bare $n and unusable names.
@@ -729,58 +761,25 @@ std::string rewrite_placeholders(const query& q, std::vector<std::string>& names
     out.reserve(b.size());
     for (size_t i = 0; i < b.size();) {
         char ch = b[i];
-        if (ch == '-' && i + 1 < b.size() && b[i + 1] == '-') {
-            auto end = b.find('\n', i);
-            end = end == std::string::npos ? b.size() : end;
-            out.append(b, i, end - i);
-            i = end;
-        } else if (ch == '/' && i + 1 < b.size() && b[i + 1] == '*') {
-            auto end = b.find("*/", i + 2);
-            end = end == std::string::npos ? b.size() : end + 2;
-            out.append(b, i, end - i);
-            i = end;
-        } else if (ch == '\'') {
-            size_t j = i + 1;
-            while (j < b.size()) {
-                if (b[j] == '\'' && j + 1 < b.size() && b[j + 1] == '\'') j += 2;
-                else if (b[j++] == '\'') break;
-            }
-            out.append(b, i, j - i);
-            i = j;
+        if (size_t e = opaque_end(b, i); e != std::string::npos) {
+            out.append(b, i, e - i);
+            i = e;
+        } else if (ch == '\'' || ch == '"') {
+            auto e = quoted_end(b, i + 1, ch, false);
+            out.append(b, i, e - i);
+            i = e;
         } else if ((ch == 'E' || ch == 'e') && i + 1 < b.size() && b[i + 1] == '\'') {
-            size_t j = i + 2;
-            while (j < b.size()) {
-                if (b[j] == '\\' && j + 1 < b.size()) j += 2;
-                else if (b[j] == '\'' && j + 1 < b.size() && b[j + 1] == '\'') j += 2;
-                else if (b[j++] == '\'') break;
-            }
-            out.append(b, i, j - i);
-            i = j;
-        } else if (ch == '"') {
-            size_t j = i + 1;
-            while (j < b.size()) {
-                if (b[j] == '"' && j + 1 < b.size() && b[j + 1] == '"') j += 2;
-                else if (b[j++] == '"') break;
-            }
-            out.append(b, i, j - i);
-            i = j;
+            auto e = quoted_end(b, i + 2, '\'', true);
+            out.append(b, i, e - i);
+            i = e;
         } else if (ch == '$') {
-            size_t j = i + 1;
-            while (j < b.size() && ident_char(b[j])) ++j;
-            if (j < b.size() && b[j] == '$' && (j == i + 1 || ident_start(b[i + 1]))) {
-                std::string delim = b.substr(i, j - i + 1);
-                auto end = b.find(delim, j + 1);
-                end = end == std::string::npos ? b.size() : end + delim.size();
-                out.append(b, i, end - i);
-                i = end;
-            } else if (i + 1 < b.size() && b[i + 1] >= '0' && b[i + 1] <= '9') {
+            if (i + 1 < b.size() && b[i + 1] >= '0' && b[i + 1] <= '9') {
                 size_t k = i + 2;
                 while (k < b.size() && b[k] >= '0' && b[k] <= '9') ++k;
                 throw std::runtime_error(q.where() + ": write :name instead of " + b.substr(i, k - i));
-            } else {
-                out += ch;
-                ++i;
             }
+            out += ch;
+            ++i;
         } else if (ch == ':') {
             if (i + 1 < b.size() && b[i + 1] == ':') {
                 out += "::";

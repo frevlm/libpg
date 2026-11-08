@@ -23,7 +23,7 @@ cmake -S . -B build && cmake --build build -j && ctest --test-dir build --output
 ```cmake
 include(FetchContent)
 FetchContent_Declare(libpg
-  URL https://github.com/frevlm/libpg/releases/download/v0.2.0/libpg-0.2.0.tar.gz)
+  URL https://github.com/frevlm/libpg/releases/download/v0.3.0/libpg-0.3.0.tar.gz)
 FetchContent_MakeAvailable(libpg)
 target_link_libraries(app PRIVATE pg)
 ```
