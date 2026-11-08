@@ -95,7 +95,7 @@ TEST_CASE("unsafe_sql takes runtime text verbatim") {
 }
 
 TEST_CASE("identifiers are quoted") {
-    REQUIRE(pg::detail::ident("we\"ird").render().text == "\"we\"\"ird\"");
+    REQUIRE(pg::ident("we\"ird").render().text == "\"we\"\"ird\"");
 }
 
 static_assert(!pg::detail::pins_text("SELECT 1"));

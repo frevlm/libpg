@@ -334,11 +334,12 @@ sql unsafe_sql(std::string text);
 // The statements with `sep` between each two.
 sql join(std::span<const sql> parts, const sql& sep);
 
+// A table or column name as a statement, double-quoted.
+sql ident(std::string_view name);
+
 namespace detail {
 // A double-quoted SQL identifier.
 std::string quote_ident(std::string_view name);
-// The identifier as a statement.
-sql ident(std::string_view name);
 }  // namespace detail
 
 }  // namespace pg

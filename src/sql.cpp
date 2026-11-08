@@ -116,7 +116,8 @@ std::string quote_ident(std::string_view name) {
     return out + '"';
 }
 
-sql ident(std::string_view name) { return unsafe_sql(quote_ident(name)); }
-
 }  // namespace detail
+
+sql ident(std::string_view name) { return unsafe_sql(detail::quote_ident(name)); }
+
 }  // namespace pg
