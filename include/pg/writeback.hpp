@@ -87,9 +87,9 @@ struct counter_def {
 };
 
 template <class Col>
-inline constexpr counter_def counter_of{Col::table::name, Col::name,
-                                        std::span<const std::string_view>(Col::table::key_columns),
-                                        scale_v<typename Col::type>};
+inline constexpr counter_def counter_of{Col::pg_table::name, Col::pg_name,
+                                        std::span<const std::string_view>(Col::pg_table::key_columns),
+                                        scale_v<typename Col::pg_type>};
 
 // The text form PostgreSQL gives a key value (`k::text`), which is also how
 // notifications name keys.
@@ -156,7 +156,7 @@ wb_element element_of(const T& v) {
 
 template <write_shape W>
 wb_row row_of(const W& row) {
-    wb_row r{W::table::name, {}, {}};
+    wb_row r{W::pg_table::name, {}, {}};
     r.columns.reserve(W::pg_names.size());
     r.values.reserve(W::pg_names.size());
     std::size_t i = 0;
@@ -186,7 +186,7 @@ struct wb_state;
 }  // namespace detail
 
 template <class Col>
-    requires detail::counter_value<typename Col::type>
+    requires detail::counter_value<typename Col::pg_type>
 class cached;
 
 // One atomic unit of write-back: rows to insert and deltas to counters, which
@@ -206,16 +206,16 @@ public:
     }
 
     template <class Col, class... K>
-        requires detail::counter_value<typename Col::type> && detail::key_args_for<typename Col::table::key, K...>
-    posting& add(typename Col::type delta, K&&... key) & {
+        requires detail::counter_value<typename Col::pg_type> && detail::key_args_for<typename Col::pg_table::key, K...>
+    posting& add(typename Col::pg_type delta, K&&... key) & {
         deltas_.push_back({detail::counter_of<Col>,
-                           detail::key_of<typename Col::table::key>(std::index_sequence_for<K...>{}, std::forward<K>(key)...),
+                           detail::key_of<typename Col::pg_table::key>(std::index_sequence_for<K...>{}, std::forward<K>(key)...),
                            detail::to_units(delta)});
         return *this;
     }
     template <class Col, class... K>
-        requires detail::counter_value<typename Col::type> && detail::key_args_for<typename Col::table::key, K...>
-    posting add(typename Col::type delta, K&&... key) && {
+        requires detail::counter_value<typename Col::pg_type> && detail::key_args_for<typename Col::pg_table::key, K...>
+    posting add(typename Col::pg_type delta, K&&... key) && {
         add<Col>(delta, std::forward<K>(key)...);
         return std::move(*this);
     }
@@ -225,7 +225,7 @@ public:
 private:
     friend class writeback;
     template <class Col>
-        requires detail::counter_value<typename Col::type>
+        requires detail::counter_value<typename Col::pg_type>
     friend class cached;
 
     posting& add_packed(const detail::counter_def& d, std::string key, std::int64_t units) & {
@@ -259,11 +259,11 @@ public:
     // The counter's value; a key not in memory is loaded (throws not_found
     // when the row does not exist).
     template <class Col, class... K>
-        requires detail::counter_value<typename Col::type> && detail::key_args_for<typename Col::table::key, K...>
-    typename Col::type get(K&&... key) {
-        return detail::from_units<typename Col::type>(value(
+        requires detail::counter_value<typename Col::pg_type> && detail::key_args_for<typename Col::pg_table::key, K...>
+    typename Col::pg_type get(K&&... key) {
+        return detail::from_units<typename Col::pg_type>(value(
             detail::counter_of<Col>,
-            detail::key_of<typename Col::table::key>(std::index_sequence_for<K...>{}, std::forward<K>(key)...)));
+            detail::key_of<typename Col::pg_table::key>(std::index_sequence_for<K...>{}, std::forward<K>(key)...)));
     }
 
     // Applies the posting's deltas to memory at once and queues it; over the
@@ -281,7 +281,7 @@ public:
 private:
     friend void detail::inject_fault(writeback&, detail::wb_fault);
     template <class Col>
-        requires detail::counter_value<typename Col::type>
+        requires detail::counter_value<typename Col::pg_type>
     friend class cached;
     void watch_counter(const detail::counter_def& d);
     std::int64_t value(const detail::counter_def& d, const std::string& key);
@@ -293,16 +293,16 @@ private:
 // submit a posting with that single delta (see writeback::submit; may throw backlog_full).
 // Postings that must commit together with inserted rows or other deltas use pg::posting.
 template <class Col>
-    requires detail::counter_value<typename Col::type>
+    requires detail::counter_value<typename Col::pg_type>
 class cached {
 public:
-    using value_type = typename Col::type;
+    using value_type = typename Col::pg_type;
 
     template <class... K>
-        requires detail::key_args_for<typename Col::table::key, K...>
+        requires detail::key_args_for<typename Col::pg_table::key, K...>
     explicit cached(writeback& wb, K&&... key)
         : wb_(&wb),
-          key_(detail::key_of<typename Col::table::key>(std::index_sequence_for<K...>{}, std::forward<K>(key)...)) {}
+          key_(detail::key_of<typename Col::pg_table::key>(std::index_sequence_for<K...>{}, std::forward<K>(key)...)) {}
 
     value_type get() const { return detail::from_units<value_type>(wb_->value(detail::counter_of<Col>, key_)); }
     operator value_type() const { return get(); }

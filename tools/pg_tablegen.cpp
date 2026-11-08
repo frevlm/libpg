@@ -153,11 +153,9 @@ const std::set<std::string>& cxx_keywords() {
 }
 
 // Names a column's tag or shape member cannot take because the generated code
-// declares a member or type of that name next to it.
+// reserves them: the pg_ prefix and the row and write shape names.
 bool clashes_with_member(const std::string& s) {
-    static const std::set<std::string> m = {"name", "table", "type", "row", "write",
-                                            "pg_columns", "pg_names", "pg_each"};
-    return m.count(s) > 0;
+    return s.starts_with("pg_") || s == "row" || s == "write";
 }
 
 // A valid C++ identifier derived from a PG identifier.
@@ -532,9 +530,9 @@ void emit_table_struct(std::ostream& o, const table& t) {
 
 void emit_column(std::ostream& o, const column& c) {
     o << "struct " << c.ident << " {\n"
-      << "    using table = table_;\n"
-      << "    using type = " << optional_of(c.cxx, c.nullable) << ";\n"
-      << "    static constexpr std::string_view name = " << quote_literal(c.name) << ";\n};\n";
+      << "    using pg_table = table_;\n"
+      << "    using pg_type = " << optional_of(c.cxx, c.nullable) << ";\n"
+      << "    static constexpr std::string_view pg_name = " << quote_literal(c.name) << ";\n};\n";
 }
 
 // Locator name for a unique constraint: by_a or by_a_and_b.
@@ -547,7 +545,7 @@ std::string locator_name(const table& t, const std::vector<std::string>& cols) {
 void emit_locator(std::ostream& o, const table& t, const std::vector<std::string>& cols) {
     auto name = locator_name(t, cols);
     o << "struct " << name << "_t {\n"
-      << "    using table = table_;\n"
+      << "    using pg_table = table_;\n"
       << "    using key = " << key_types(t, cols) << ";\n"
       << "    static constexpr " << names_array("key_columns", cols) << ";\n"
       << "};\n"
@@ -578,7 +576,7 @@ void emit_write_shape(std::ostream& o, const table& t) {
         names.push_back(c.name);
     }
     o << "struct write {\n"
-      << "    using table = table_;\n";
+      << "    using pg_table = table_;\n";
     emit_members(o, ms);
     o << "    static constexpr " << names_array("pg_names", names) << ";\n";
     emit_each(o, ms, " const");

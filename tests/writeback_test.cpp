@@ -31,14 +31,14 @@ struct balances {
     static constexpr std::array<std::string_view, 1> key_columns{"id"};
 };
 struct amount {
-    using table = balances;
-    using type = dec;
-    static constexpr std::string_view name = "amount";
+    using pg_table = balances;
+    using pg_type = dec;
+    static constexpr std::string_view pg_name = "amount";
 };
 struct points {
-    using table = balances;
-    using type = std::int64_t;
-    static constexpr std::string_view name = "points";
+    using pg_table = balances;
+    using pg_type = std::int64_t;
+    static constexpr std::string_view pg_name = "points";
 };
 struct stock {
     static constexpr std::string_view name = "wb_stock";
@@ -46,15 +46,15 @@ struct stock {
     static constexpr std::array<std::string_view, 2> key_columns{"warehouse", "sku"};
 };
 struct qty {
-    using table = stock;
-    using type = std::int64_t;
-    static constexpr std::string_view name = "qty";
+    using pg_table = stock;
+    using pg_type = std::int64_t;
+    static constexpr std::string_view pg_name = "qty";
 };
 struct ledger {
     static constexpr std::string_view name = "wb_ledger";
 };
 struct ledger_write {
-    using table = ledger;
+    using pg_table = ledger;
     pg::field<std::int64_t> id{};
     std::int64_t account{};
     dec amount{};

@@ -30,9 +30,9 @@ struct balances {
     static constexpr std::array<std::string_view, 1> key_columns{"id"};
 };
 struct points {
-    using table = balances;
-    using type = std::int64_t;
-    static constexpr std::string_view name = "points";
+    using pg_table = balances;
+    using pg_type = std::int64_t;
+    static constexpr std::string_view pg_name = "points";
 };
 
 const std::string database = "libpg_pooler";

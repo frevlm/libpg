@@ -32,24 +32,24 @@ struct cell_items {
     static constexpr std::array<std::string_view, 2> key_columns{"a", "b"};
 };
 struct by_code {
-    using table = cell_items;
+    using pg_table = cell_items;
     using key = std::tuple<std::string>;
     static constexpr std::array<std::string_view, 1> key_columns{"code"};
 };
 struct qty_col {
-    using table = cell_items;
-    using type = std::int32_t;
-    static constexpr std::string_view name = "qty";
+    using pg_table = cell_items;
+    using pg_type = std::int32_t;
+    static constexpr std::string_view pg_name = "qty";
 };
 struct price_col {
-    using table = cell_items;
-    using type = pg::decimal<6>;
-    static constexpr std::string_view name = "price";
+    using pg_table = cell_items;
+    using pg_type = pg::decimal<6>;
+    static constexpr std::string_view pg_name = "price";
 };
 struct note_col {
-    using table = cell_items;
-    using type = std::optional<std::string>;
-    static constexpr std::string_view name = "note";
+    using pg_table = cell_items;
+    using pg_type = std::optional<std::string>;
+    static constexpr std::string_view pg_name = "note";
 };
 
 void reset(pg::conn& c) {

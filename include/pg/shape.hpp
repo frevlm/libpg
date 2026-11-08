@@ -181,13 +181,13 @@ concept read_shape = std::is_default_constructible_v<T> && requires(T& t) {
 };
 
 // A struct that is one row to INSERT into its table:
-//   using table = <table tag>;                                   // table::name
+//   using pg_table = <table tag>;                                // pg_table::name
 //   static constexpr std::array<std::string_view, N> pg_names;  // column names
 //   template <class F> void pg_each(F&& f) const;              // f(member) in pg_names order
 // Members are T, std::optional<T> (NULL when empty) or pg::field<T> (DEFAULT when unset).
 template <class T>
 concept write_shape = requires(const T& t) {
-    { T::table::name } -> std::convertible_to<std::string_view>;
+    { T::pg_table::name } -> std::convertible_to<std::string_view>;
     { T::pg_names.size() } -> std::convertible_to<std::size_t>;
     t.pg_each([](const auto&) {});
 };
@@ -200,7 +200,7 @@ namespace detail {
 // `INSERT INTO "table" DEFAULT VALUES` when the shape has no columns.
 template <write_shape W>
 sql insert_statement(const W& row) {
-    if constexpr (W::pg_names.size() == 0) return sql{"INSERT INTO {} DEFAULT VALUES", ident(W::table::name)};
+    if constexpr (W::pg_names.size() == 0) return sql{"INSERT INTO {} DEFAULT VALUES", ident(W::pg_table::name)};
     sql cols, values;
     std::size_t i = 0;
     row.pg_each([&](const auto& m) {
@@ -212,7 +212,7 @@ sql insert_statement(const W& row) {
         else if (m.is_set()) values += sql{"{}", m.value()};
         else values += sql{"DEFAULT"};
     });
-    return sql{"INSERT INTO {} ({}) VALUES ({})", ident(W::table::name), cols, values};
+    return sql{"INSERT INTO {} ({}) VALUES ({})", ident(W::pg_table::name), cols, values};
 }
 
 std::int64_t exec_on(conn& c, const sql& q);
@@ -320,17 +320,17 @@ std::int64_t insert_all_span(conn& c, std::span<const W> rows) {
     if (rows.empty()) return 0;
     const copy_columns cols = columns_of(rows);
     if (!cols.uniform || cols.names.empty()) return insert_each(c, rows);
-    const std::vector<copy_target> targets = copy_targets(c, W::table::name, cols.names);
+    const std::vector<copy_target> targets = copy_targets(c, W::pg_table::name, cols.names);
     if (targets.size() != cols.names.size() || !all_encodable(rows.front(), cols, targets))
         return insert_each(c, rows);
     const bool own = !in_transaction(c);
     try {
-        return copy_rows(c, copy_statement(W::table::name, cols.names), copy_body(rows, cols, targets));
+        return copy_rows(c, copy_statement(W::pg_table::name, cols.names), copy_body(rows, cols, targets));
     } catch (const error& e) {
         if (!own || e.sqlstate != "22P03") throw;
     }
     // The cached target types were wrong: forget them and INSERT instead.
-    forget_copy_targets(c, W::table::name, cols.names);
+    forget_copy_targets(c, W::pg_table::name, cols.names);
     return insert_each(c, rows);
 }
 

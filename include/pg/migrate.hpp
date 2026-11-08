@@ -25,8 +25,8 @@ struct watched_column {
 // The watched column of a generated column tag.
 template <class Col>
 watched_column watch() {
-    watched_column w{std::string(Col::table::name), std::string(Col::name), {}};
-    for (std::string_view k : Col::table::key_columns) w.key_columns.emplace_back(k);
+    watched_column w{std::string(Col::pg_table::name), std::string(Col::pg_name), {}};
+    for (std::string_view k : Col::pg_table::key_columns) w.key_columns.emplace_back(k);
     return w;
 }
 

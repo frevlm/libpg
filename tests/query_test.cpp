@@ -61,7 +61,7 @@ struct shape_items_ {
 
 // A write shape over shape_items.
 struct shape_write {
-    using table = shape_items_;
+    using pg_table = shape_items_;
     static constexpr std::array<std::string_view, 4> pg_names{"id", "label", "note", "n"};
     std::int32_t id = 0;
     pg::field<std::string> label;
@@ -88,7 +88,7 @@ struct insert_kinds_ {
 };
 
 struct kinds_write {
-    using table = insert_kinds_;
+    using pg_table = insert_kinds_;
     static constexpr std::array<std::string_view, 17> pg_names{
         "i2", "i4", "i8", "f8", "num", "flag", "t", "v", "jb", "j", "ts", "d", "u", "b", "e", "maybe", "nt"};
     std::int16_t i2 = 0;
@@ -136,7 +136,7 @@ struct insert_inet_ {
 };
 
 struct inet_write {
-    using table = insert_inet_;
+    using pg_table = insert_inet_;
     static constexpr std::array<std::string_view, 2> pg_names{"id", "addr"};
     std::int32_t id = 0;
     std::string addr;
@@ -153,7 +153,7 @@ struct insert_def_ {
 };
 
 struct def_write {
-    using table = insert_def_;
+    using pg_table = insert_def_;
     static constexpr std::array<std::string_view, 3> pg_names{"id", "label", "n"};
     std::int32_t id = 0;
     pg::field<std::string> label;
@@ -172,7 +172,7 @@ struct insert_atomic_ {
 };
 
 struct atomic_write {
-    using table = insert_atomic_;
+    using pg_table = insert_atomic_;
     static constexpr std::array<std::string_view, 1> pg_names{"id"};
     std::int32_t id = 0;
 
@@ -747,7 +747,7 @@ struct no_cols_table {
 
 // A write shape without columns.
 struct no_cols_write {
-    using table = no_cols_table;
+    using pg_table = no_cols_table;
     static constexpr std::array<std::string_view, 0> pg_names{};
     template <class F>
     void pg_each(F&&) const {}

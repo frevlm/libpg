@@ -27,15 +27,15 @@ struct accounts_ {
     static constexpr std::array<std::string_view, 1> key_columns{"id"};
 };
 struct balance {
-    using table = accounts_;
-    using type = money;
-    static constexpr std::string_view name = "balance";
+    using pg_table = accounts_;
+    using pg_type = money;
+    static constexpr std::string_view pg_name = "balance";
 };
 struct events_ {
     static constexpr std::string_view name = "events";
 };
 struct event_write {
-    using table = events_;
+    using pg_table = events_;
     std::int64_t account_id{};
     money amount{};
     std::string note{};
@@ -55,7 +55,7 @@ struct bench_requests_ {
 
 // revlm's requests row without its identity column.
 struct request_row {
-    using table = bench_requests_;
+    using pg_table = bench_requests_;
     static constexpr std::array<std::string_view, 34> pg_names{
         "time",          "request_id",      "response_id",       "endpoint",      "method",
         "user_id",       "token_id",        "input_tokens",      "output_tokens", "cache_read_tokens",

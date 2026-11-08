@@ -98,9 +98,9 @@ struct accounts_tag {
     static constexpr std::array<std::string_view, 1> key_columns{"id"};
 };
 struct balance_tag {
-    using table = accounts_tag;
-    using type = money;
-    static constexpr std::string_view name = "balance";
+    using pg_table = accounts_tag;
+    using pg_type = money;
+    static constexpr std::string_view pg_name = "balance";
 };
 
 void run_cell_add(const Cfg& cfg) {

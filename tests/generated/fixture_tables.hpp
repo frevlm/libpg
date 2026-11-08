@@ -19,9 +19,9 @@ struct table_ {
     static constexpr std::array<std::string_view, 1> key_columns{"id"};
 };
 struct id {
-    using table = table_;
-    using type = std::int32_t;
-    static constexpr std::string_view name = "id";
+    using pg_table = table_;
+    using pg_type = std::int32_t;
+    static constexpr std::string_view pg_name = "id";
 };
 struct row {
     std::int32_t id{};
@@ -32,7 +32,7 @@ struct row {
     }
 };
 struct write {
-    using table = table_;
+    using pg_table = table_;
     std::int32_t id{};
     static constexpr std::array<std::string_view, 1> pg_names{"id"};
     template <class F>
@@ -47,69 +47,69 @@ struct table_ {
     static constexpr std::string_view name = "events";
 };
 struct ticket {
-    using table = table_;
-    using type = std::int64_t;
-    static constexpr std::string_view name = "ticket";
+    using pg_table = table_;
+    using pg_type = std::int64_t;
+    static constexpr std::string_view pg_name = "ticket";
 };
-struct type_ {
-    using table = table_;
-    using type = std::string;
-    static constexpr std::string_view name = "type";
+struct type {
+    using pg_table = table_;
+    using pg_type = std::string;
+    static constexpr std::string_view pg_name = "type";
 };
 struct time {
-    using table = table_;
-    using type = ::pg::timestamptz;
-    static constexpr std::string_view name = "time";
+    using pg_table = table_;
+    using pg_type = ::pg::timestamptz;
+    static constexpr std::string_view pg_name = "time";
 };
 struct class_ {
-    using table = table_;
-    using type = std::optional<std::string>;
-    static constexpr std::string_view name = "class";
+    using pg_table = table_;
+    using pg_type = std::optional<std::string>;
+    static constexpr std::string_view pg_name = "class";
 };
-struct name_ {
-    using table = table_;
-    using type = std::optional<std::string>;
-    static constexpr std::string_view name = "name";
+struct name {
+    using pg_table = table_;
+    using pg_type = std::optional<std::string>;
+    static constexpr std::string_view pg_name = "name";
 };
 struct seq {
-    using table = table_;
-    using type = std::int64_t;
-    static constexpr std::string_view name = "seq";
+    using pg_table = table_;
+    using pg_type = std::int64_t;
+    static constexpr std::string_view pg_name = "seq";
 };
 struct row {
     std::int64_t ticket{};
-    std::string type_{};
+    std::string type{};
     ::pg::timestamptz time{};
     std::optional<std::string> class_{};
-    std::optional<std::string> name_{};
+    std::optional<std::string> name{};
     std::int64_t seq{};
     static constexpr std::size_t pg_columns = 6;
     template <class F>
     void pg_each(F&& f) {
         f(ticket);
-        f(type_);
+        f(type);
         f(time);
         f(class_);
-        f(name_);
+        f(name);
         f(seq);
     }
 };
 struct write {
-    using table = table_;
+    using pg_table = table_;
     ::pg::field<std::int64_t> ticket{};
-    std::string type_{};
+    std::string type{};
     ::pg::timestamptz time{};
     std::optional<std::string> class_{};
-    std::optional<std::string> name_{};
+    std::optional<std::string> name{};
     ::pg::field<std::int64_t> seq{};
     static constexpr std::array<std::string_view, 6> pg_names{"ticket", "type", "time", "class", "name", "seq"};
     template <class F>
     void pg_each(F&& f) const {
         f(ticket);
-        f(type_);
+        f(type);
         f(time);
         f(class_);
-        f(name_);
+        f(name);
         f(seq);
     }
 };
@@ -122,14 +122,14 @@ struct table_ {
     static constexpr std::array<std::string_view, 1> key_columns{"id"};
 };
 struct id {
-    using table = table_;
-    using type = std::int16_t;
-    static constexpr std::string_view name = "id";
+    using pg_table = table_;
+    using pg_type = std::int16_t;
+    static constexpr std::string_view pg_name = "id";
 };
 struct title {
-    using table = table_;
-    using type = std::string;
-    static constexpr std::string_view name = "title";
+    using pg_table = table_;
+    using pg_type = std::string;
+    static constexpr std::string_view pg_name = "title";
 };
 struct row {
     std::int16_t id{};
@@ -142,7 +142,7 @@ struct row {
     }
 };
 struct write {
-    using table = table_;
+    using pg_table = table_;
     std::int16_t id{};
     std::string title{};
     static constexpr std::array<std::string_view, 2> pg_names{"id", "title"};
@@ -161,19 +161,19 @@ struct table_ {
     static constexpr std::array<std::string_view, 2> key_columns{"id", "day"};
 };
 struct id {
-    using table = table_;
-    using type = std::int32_t;
-    static constexpr std::string_view name = "id";
+    using pg_table = table_;
+    using pg_type = std::int32_t;
+    static constexpr std::string_view pg_name = "id";
 };
 struct day {
-    using table = table_;
-    using type = ::pg::timestamptz;
-    static constexpr std::string_view name = "day";
+    using pg_table = table_;
+    using pg_type = ::pg::timestamptz;
+    static constexpr std::string_view pg_name = "day";
 };
 struct val {
-    using table = table_;
-    using type = std::optional<double>;
-    static constexpr std::string_view name = "val";
+    using pg_table = table_;
+    using pg_type = std::optional<double>;
+    static constexpr std::string_view pg_name = "val";
 };
 struct row {
     std::int32_t id{};
@@ -188,7 +188,7 @@ struct row {
     }
 };
 struct write {
-    using table = table_;
+    using pg_table = table_;
     std::int32_t id{};
     ::pg::timestamptz day{};
     std::optional<double> val{};
@@ -209,27 +209,27 @@ struct table_ {
     static constexpr std::array<std::string_view, 2> key_columns{"group_id", "user_id"};
 };
 struct user_id {
-    using table = table_;
-    using type = std::int32_t;
-    static constexpr std::string_view name = "user_id";
+    using pg_table = table_;
+    using pg_type = std::int32_t;
+    static constexpr std::string_view pg_name = "user_id";
 };
 struct group_id {
-    using table = table_;
-    using type = std::int32_t;
-    static constexpr std::string_view name = "group_id";
+    using pg_table = table_;
+    using pg_type = std::int32_t;
+    static constexpr std::string_view pg_name = "group_id";
 };
 struct role {
-    using table = table_;
-    using type = std::string;
-    static constexpr std::string_view name = "role";
+    using pg_table = table_;
+    using pg_type = std::string;
+    static constexpr std::string_view pg_name = "role";
 };
 struct since {
-    using table = table_;
-    using type = std::optional<::pg::timestamptz>;
-    static constexpr std::string_view name = "since";
+    using pg_table = table_;
+    using pg_type = std::optional<::pg::timestamptz>;
+    static constexpr std::string_view pg_name = "since";
 };
 struct by_user_id_and_role_t {
-    using table = table_;
+    using pg_table = table_;
     using key = std::tuple<std::int32_t, std::string>;
     static constexpr std::array<std::string_view, 2> key_columns{"user_id", "role"};
 };
@@ -249,7 +249,7 @@ struct row {
     }
 };
 struct write {
-    using table = table_;
+    using pg_table = table_;
     std::int32_t user_id{};
     std::int32_t group_id{};
     std::string role{};
@@ -272,24 +272,24 @@ struct table_ {
     static constexpr std::array<std::string_view, 1> key_columns{"id"};
 };
 struct id {
-    using table = table_;
-    using type = std::int32_t;
-    static constexpr std::string_view name = "id";
+    using pg_table = table_;
+    using pg_type = std::int32_t;
+    static constexpr std::string_view pg_name = "id";
 };
 struct limit_ {
-    using table = table_;
-    using type = std::int32_t;
-    static constexpr std::string_view name = "limit_";
+    using pg_table = table_;
+    using pg_type = std::int32_t;
+    static constexpr std::string_view pg_name = "limit_";
 };
 struct soft {
-    using table = table_;
-    using type = std::int32_t;
-    static constexpr std::string_view name = "soft";
+    using pg_table = table_;
+    using pg_type = std::int32_t;
+    static constexpr std::string_view pg_name = "soft";
 };
 struct cost {
-    using table = table_;
-    using type = std::optional<::pg::decimal<2>>;
-    static constexpr std::string_view name = "cost";
+    using pg_table = table_;
+    using pg_type = std::optional<::pg::decimal<2>>;
+    static constexpr std::string_view pg_name = "cost";
 };
 struct row {
     std::int32_t id{};
@@ -306,7 +306,7 @@ struct row {
     }
 };
 struct write {
-    using table = table_;
+    using pg_table = table_;
     std::int32_t id{};
     std::int32_t limit_{};
     std::int32_t soft{};
@@ -329,112 +329,112 @@ struct table_ {
     static constexpr std::array<std::string_view, 1> key_columns{"id"};
 };
 struct id {
-    using table = table_;
-    using type = std::int32_t;
-    static constexpr std::string_view name = "id";
+    using pg_table = table_;
+    using pg_type = std::int32_t;
+    static constexpr std::string_view pg_name = "id";
 };
 struct username {
-    using table = table_;
-    using type = std::string;
-    static constexpr std::string_view name = "username";
+    using pg_table = table_;
+    using pg_type = std::string;
+    static constexpr std::string_view pg_name = "username";
 };
 struct email {
-    using table = table_;
-    using type = std::optional<std::string>;
-    static constexpr std::string_view name = "email";
+    using pg_table = table_;
+    using pg_type = std::optional<std::string>;
+    static constexpr std::string_view pg_name = "email";
 };
 struct nick {
-    using table = table_;
-    using type = std::string;
-    static constexpr std::string_view name = "nick";
+    using pg_table = table_;
+    using pg_type = std::string;
+    static constexpr std::string_view pg_name = "nick";
 };
 struct active {
-    using table = table_;
-    using type = bool;
-    static constexpr std::string_view name = "active";
+    using pg_table = table_;
+    using pg_type = bool;
+    static constexpr std::string_view pg_name = "active";
 };
 struct rank {
-    using table = table_;
-    using type = std::int16_t;
-    static constexpr std::string_view name = "rank";
+    using pg_table = table_;
+    using pg_type = std::int16_t;
+    static constexpr std::string_view pg_name = "rank";
 };
 struct points {
-    using table = table_;
-    using type = std::int64_t;
-    static constexpr std::string_view name = "points";
+    using pg_table = table_;
+    using pg_type = std::int64_t;
+    static constexpr std::string_view pg_name = "points";
 };
 struct score {
-    using table = table_;
-    using type = std::optional<double>;
-    static constexpr std::string_view name = "score";
+    using pg_table = table_;
+    using pg_type = std::optional<double>;
+    static constexpr std::string_view pg_name = "score";
 };
 struct balance {
-    using table = table_;
-    using type = ::pg::decimal<2>;
-    static constexpr std::string_view name = "balance";
+    using pg_table = table_;
+    using pg_type = ::pg::decimal<2>;
+    static constexpr std::string_view pg_name = "balance";
 };
 struct profile {
-    using table = table_;
-    using type = ::pg::jsonb;
-    static constexpr std::string_view name = "profile";
+    using pg_table = table_;
+    using pg_type = ::pg::jsonb;
+    static constexpr std::string_view pg_name = "profile";
 };
 struct raw {
-    using table = table_;
-    using type = std::optional<::pg::jsonb>;
-    static constexpr std::string_view name = "raw";
+    using pg_table = table_;
+    using pg_type = std::optional<::pg::jsonb>;
+    static constexpr std::string_view pg_name = "raw";
 };
 struct joined {
-    using table = table_;
-    using type = ::pg::timestamptz;
-    static constexpr std::string_view name = "joined";
+    using pg_table = table_;
+    using pg_type = ::pg::timestamptz;
+    static constexpr std::string_view pg_name = "joined";
 };
 struct birthday {
-    using table = table_;
-    using type = std::optional<::pg::date>;
-    static constexpr std::string_view name = "birthday";
+    using pg_table = table_;
+    using pg_type = std::optional<::pg::date>;
+    static constexpr std::string_view pg_name = "birthday";
 };
 struct ratio {
-    using table = table_;
-    using type = std::optional<float>;
-    static constexpr std::string_view name = "ratio";
+    using pg_table = table_;
+    using pg_type = std::optional<float>;
+    static constexpr std::string_view pg_name = "ratio";
 };
 struct ip {
-    using table = table_;
-    using type = std::optional<std::string>;
-    static constexpr std::string_view name = "ip";
+    using pg_table = table_;
+    using pg_type = std::optional<std::string>;
+    static constexpr std::string_view pg_name = "ip";
 };
 struct uid {
-    using table = table_;
-    using type = ::pg::uuid;
-    static constexpr std::string_view name = "uid";
+    using pg_table = table_;
+    using pg_type = ::pg::uuid;
+    static constexpr std::string_view pg_name = "uid";
 };
 struct avatar {
-    using table = table_;
-    using type = std::optional<::pg::bytea>;
-    static constexpr std::string_view name = "avatar";
+    using pg_table = table_;
+    using pg_type = std::optional<::pg::bytea>;
+    static constexpr std::string_view pg_name = "avatar";
 };
 struct stake {
-    using table = table_;
-    using type = ::pg::decimal<6>;
-    static constexpr std::string_view name = "stake";
+    using pg_table = table_;
+    using pg_type = ::pg::decimal<6>;
+    static constexpr std::string_view pg_name = "stake";
 };
 struct big {
-    using table = table_;
-    using type = std::optional<::pg::numeric>;
-    static constexpr std::string_view name = "big";
+    using pg_table = table_;
+    using pg_type = std::optional<::pg::numeric>;
+    static constexpr std::string_view pg_name = "big";
 };
 struct mood {
-    using table = table_;
-    using type = std::optional<std::string>;
-    static constexpr std::string_view name = "mood";
+    using pg_table = table_;
+    using pg_type = std::optional<std::string>;
+    static constexpr std::string_view pg_name = "mood";
 };
 struct level {
-    using table = table_;
-    using type = std::optional<std::int32_t>;
-    static constexpr std::string_view name = "level";
+    using pg_table = table_;
+    using pg_type = std::optional<std::int32_t>;
+    static constexpr std::string_view pg_name = "level";
 };
 struct by_username_t {
-    using table = table_;
+    using pg_table = table_;
     using key = std::tuple<std::string>;
     static constexpr std::array<std::string_view, 1> key_columns{"username"};
 };
@@ -488,7 +488,7 @@ struct row {
     }
 };
 struct write {
-    using table = table_;
+    using pg_table = table_;
     std::string username{};
     std::optional<std::string> email{};
     ::pg::field<std::string> nick{};

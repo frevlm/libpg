@@ -239,16 +239,16 @@ struct watch_t_ {
     static constexpr std::array<std::string_view, 1> key_columns{"id"};
 };
 struct bal {
-    using table = watch_t_;
-    static constexpr std::string_view name = "bal";
+    using pg_table = watch_t_;
+    static constexpr std::string_view pg_name = "bal";
 };
 struct watch_c_ {
     static constexpr std::string_view name = "watch_c";
     static constexpr std::array<std::string_view, 2> key_columns{"a", "b"};
 };
 struct v {
-    using table = watch_c_;
-    static constexpr std::string_view name = "v";
+    using pg_table = watch_c_;
+    static constexpr std::string_view pg_name = "v";
 };
 }  // namespace tags
 
