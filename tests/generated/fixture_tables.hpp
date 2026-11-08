@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -9,6 +10,7 @@
 #include <tuple>
 
 #include "pg/codec.hpp"
+#include "pg/shape.hpp"
 
 namespace db::after_commit_probe {
 struct table_ {
@@ -20,6 +22,23 @@ struct id {
     using table = table_;
     using type = std::int32_t;
     static constexpr std::string_view name = "id";
+};
+struct row {
+    std::int32_t id{};
+    static constexpr std::size_t pg_columns = 1;
+    template <class F>
+    void pg_each(F&& f) {
+        f(id);
+    }
+};
+struct write {
+    using table = table_;
+    std::int32_t id{};
+    static constexpr std::array<std::string_view, 1> pg_names{"id"};
+    template <class F>
+    void pg_each(F&& f) const {
+        f(id);
+    }
 };
 }
 
@@ -52,6 +71,48 @@ struct name_ {
     using type = std::optional<std::string>;
     static constexpr std::string_view name = "name";
 };
+struct seq {
+    using table = table_;
+    using type = std::int64_t;
+    static constexpr std::string_view name = "seq";
+};
+struct row {
+    std::int64_t ticket{};
+    std::string type_{};
+    ::pg::timestamptz time{};
+    std::optional<std::string> class_{};
+    std::optional<std::string> name_{};
+    std::int64_t seq{};
+    static constexpr std::size_t pg_columns = 6;
+    template <class F>
+    void pg_each(F&& f) {
+        f(ticket);
+        f(type_);
+        f(time);
+        f(class_);
+        f(name_);
+        f(seq);
+    }
+};
+struct write {
+    using table = table_;
+    ::pg::field<std::int64_t> ticket{};
+    std::string type_{};
+    ::pg::timestamptz time{};
+    std::optional<std::string> class_{};
+    std::optional<std::string> name_{};
+    ::pg::field<std::int64_t> seq{};
+    static constexpr std::array<std::string_view, 6> pg_names{"ticket", "type", "time", "class", "name", "seq"};
+    template <class F>
+    void pg_each(F&& f) const {
+        f(ticket);
+        f(type_);
+        f(time);
+        f(class_);
+        f(name_);
+        f(seq);
+    }
+};
 }
 
 namespace db::groups {
@@ -69,6 +130,27 @@ struct title {
     using table = table_;
     using type = std::string;
     static constexpr std::string_view name = "title";
+};
+struct row {
+    std::int16_t id{};
+    std::string title{};
+    static constexpr std::size_t pg_columns = 2;
+    template <class F>
+    void pg_each(F&& f) {
+        f(id);
+        f(title);
+    }
+};
+struct write {
+    using table = table_;
+    std::int16_t id{};
+    std::string title{};
+    static constexpr std::array<std::string_view, 2> pg_names{"id", "title"};
+    template <class F>
+    void pg_each(F&& f) const {
+        f(id);
+        f(title);
+    }
 };
 }
 
@@ -92,6 +174,31 @@ struct val {
     using table = table_;
     using type = std::optional<double>;
     static constexpr std::string_view name = "val";
+};
+struct row {
+    std::int32_t id{};
+    ::pg::timestamptz day{};
+    std::optional<double> val{};
+    static constexpr std::size_t pg_columns = 3;
+    template <class F>
+    void pg_each(F&& f) {
+        f(id);
+        f(day);
+        f(val);
+    }
+};
+struct write {
+    using table = table_;
+    std::int32_t id{};
+    ::pg::timestamptz day{};
+    std::optional<double> val{};
+    static constexpr std::array<std::string_view, 3> pg_names{"id", "day", "val"};
+    template <class F>
+    void pg_each(F&& f) const {
+        f(id);
+        f(day);
+        f(val);
+    }
 };
 }
 
@@ -127,6 +234,35 @@ struct by_user_id_and_role_t {
     static constexpr std::array<std::string_view, 2> key_columns{"user_id", "role"};
 };
 inline constexpr by_user_id_and_role_t by_user_id_and_role{};
+struct row {
+    std::int32_t user_id{};
+    std::int32_t group_id{};
+    std::string role{};
+    std::optional<::pg::timestamptz> since{};
+    static constexpr std::size_t pg_columns = 4;
+    template <class F>
+    void pg_each(F&& f) {
+        f(user_id);
+        f(group_id);
+        f(role);
+        f(since);
+    }
+};
+struct write {
+    using table = table_;
+    std::int32_t user_id{};
+    std::int32_t group_id{};
+    std::string role{};
+    std::optional<::pg::timestamptz> since{};
+    static constexpr std::array<std::string_view, 4> pg_names{"user_id", "group_id", "role", "since"};
+    template <class F>
+    void pg_each(F&& f) const {
+        f(user_id);
+        f(group_id);
+        f(role);
+        f(since);
+    }
+};
 }
 
 namespace db::quotas {
@@ -149,6 +285,40 @@ struct soft {
     using table = table_;
     using type = std::int32_t;
     static constexpr std::string_view name = "soft";
+};
+struct cost {
+    using table = table_;
+    using type = std::optional<::pg::decimal<2>>;
+    static constexpr std::string_view name = "cost";
+};
+struct row {
+    std::int32_t id{};
+    std::int32_t limit_{};
+    std::int32_t soft{};
+    std::optional<::pg::decimal<2>> cost{};
+    static constexpr std::size_t pg_columns = 4;
+    template <class F>
+    void pg_each(F&& f) {
+        f(id);
+        f(limit_);
+        f(soft);
+        f(cost);
+    }
+};
+struct write {
+    using table = table_;
+    std::int32_t id{};
+    std::int32_t limit_{};
+    std::int32_t soft{};
+    std::optional<::pg::decimal<2>> cost{};
+    static constexpr std::array<std::string_view, 4> pg_names{"id", "limit_", "soft", "cost"};
+    template <class F>
+    void pg_each(F&& f) const {
+        f(id);
+        f(limit_);
+        f(soft);
+        f(cost);
+    }
 };
 }
 
@@ -200,7 +370,7 @@ struct score {
 };
 struct balance {
     using table = table_;
-    using type = ::pg::numeric;
+    using type = ::pg::decimal<2>;
     static constexpr std::string_view name = "balance";
 };
 struct profile {
@@ -220,18 +390,48 @@ struct joined {
 };
 struct birthday {
     using table = table_;
-    using type = std::optional<std::string>;  // PG type: date
+    using type = std::optional<::pg::date>;
     static constexpr std::string_view name = "birthday";
 };
 struct ratio {
     using table = table_;
-    using type = std::optional<std::string>;  // PG type: real
+    using type = std::optional<float>;
     static constexpr std::string_view name = "ratio";
 };
 struct ip {
     using table = table_;
-    using type = std::optional<std::string>;  // PG type: inet
+    using type = std::optional<std::string>;
     static constexpr std::string_view name = "ip";
+};
+struct uid {
+    using table = table_;
+    using type = ::pg::uuid;
+    static constexpr std::string_view name = "uid";
+};
+struct avatar {
+    using table = table_;
+    using type = std::optional<::pg::bytea>;
+    static constexpr std::string_view name = "avatar";
+};
+struct stake {
+    using table = table_;
+    using type = ::pg::decimal<6>;
+    static constexpr std::string_view name = "stake";
+};
+struct big {
+    using table = table_;
+    using type = std::optional<::pg::numeric>;
+    static constexpr std::string_view name = "big";
+};
+struct mood {
+    using table = table_;
+    using type = std::optional<std::string>;
+    static constexpr std::string_view name = "mood";
+};
+struct level {
+    using table = table_;
+    using type = std::optional<std::int32_t>;
+    static constexpr std::string_view name = "level";
 };
 struct by_username_t {
     using table = table_;
@@ -239,4 +439,97 @@ struct by_username_t {
     static constexpr std::array<std::string_view, 1> key_columns{"username"};
 };
 inline constexpr by_username_t by_username{};
+struct row {
+    std::int32_t id{};
+    std::string username{};
+    std::optional<std::string> email{};
+    std::string nick{};
+    bool active{};
+    std::int16_t rank{};
+    std::int64_t points{};
+    std::optional<double> score{};
+    ::pg::decimal<2> balance{};
+    ::pg::jsonb profile{};
+    std::optional<::pg::jsonb> raw{};
+    ::pg::timestamptz joined{};
+    std::optional<::pg::date> birthday{};
+    std::optional<float> ratio{};
+    std::optional<std::string> ip{};
+    ::pg::uuid uid{};
+    std::optional<::pg::bytea> avatar{};
+    ::pg::decimal<6> stake{};
+    std::optional<::pg::numeric> big{};
+    std::optional<std::string> mood{};
+    std::optional<std::int32_t> level{};
+    static constexpr std::size_t pg_columns = 21;
+    template <class F>
+    void pg_each(F&& f) {
+        f(id);
+        f(username);
+        f(email);
+        f(nick);
+        f(active);
+        f(rank);
+        f(points);
+        f(score);
+        f(balance);
+        f(profile);
+        f(raw);
+        f(joined);
+        f(birthday);
+        f(ratio);
+        f(ip);
+        f(uid);
+        f(avatar);
+        f(stake);
+        f(big);
+        f(mood);
+        f(level);
+    }
+};
+struct write {
+    using table = table_;
+    std::string username{};
+    std::optional<std::string> email{};
+    ::pg::field<std::string> nick{};
+    ::pg::field<bool> active{};
+    ::pg::field<std::int16_t> rank{};
+    ::pg::field<std::int64_t> points{};
+    std::optional<double> score{};
+    ::pg::field<::pg::decimal<2>> balance{};
+    ::pg::field<::pg::jsonb> profile{};
+    std::optional<::pg::jsonb> raw{};
+    ::pg::field<::pg::timestamptz> joined{};
+    std::optional<::pg::date> birthday{};
+    std::optional<float> ratio{};
+    std::optional<std::string> ip{};
+    ::pg::field<::pg::uuid> uid{};
+    std::optional<::pg::bytea> avatar{};
+    ::pg::field<::pg::decimal<6>> stake{};
+    std::optional<::pg::numeric> big{};
+    std::optional<std::string> mood{};
+    static constexpr std::array<std::string_view, 19> pg_names{"username", "email", "nick", "active", "rank", "points", "score", "balance", "profile", "raw", "joined", "birthday", "ratio", "ip", "uid", "avatar", "stake", "big", "mood"};
+    template <class F>
+    void pg_each(F&& f) const {
+        f(username);
+        f(email);
+        f(nick);
+        f(active);
+        f(rank);
+        f(points);
+        f(score);
+        f(balance);
+        f(profile);
+        f(raw);
+        f(joined);
+        f(birthday);
+        f(ratio);
+        f(ip);
+        f(uid);
+        f(avatar);
+        f(stake);
+        f(big);
+        f(mood);
+    }
+};
 }

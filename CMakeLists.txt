@@ -15,10 +15,17 @@ find_package(Threads REQUIRED)
 
 add_library(pg
   src/codec.cpp
-  src/connection.cpp
   src/engine.cpp
-  src/batch.cpp
-  src/cached.cpp
+  src/error.cpp
+  src/libpg_schema.cpp
+  src/migrate.cpp
+  src/pool.cpp
+  src/prefetch.cpp
+  src/sha256.cpp
+  src/sql.cpp
+  src/writeback.cpp
+  src/writeback_listen.cpp
+  src/writeback_writer.cpp
 )
 target_include_directories(pg PUBLIC include)
 target_compile_features(pg PUBLIC cxx_std_20)

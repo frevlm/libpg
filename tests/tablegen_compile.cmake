@@ -1,12 +1,15 @@
-# Runs pg_tablegen on SCHEMA and writes OUT. With EXPECTED, OUT must equal that
-# file; with CXX, OUT must compile on its own against INCLUDE_DIR.
+# Runs pg_tablegen on SCHEMA and writes OUT. ARGS holds further generator
+# arguments separated by "|". With EXPECTED, OUT must equal that file; with
+# QUERIES_OUT and EXPECTED_QUERIES, likewise for the query header; with CXX,
+# OUT must compile on its own against INCLUDE_DIR.
 foreach(var TABLEGEN DSN SCHEMA OUT)
   if(NOT DEFINED ${var})
     message(FATAL_ERROR "${var} is not set")
   endif()
 endforeach()
 
-execute_process(COMMAND ${TABLEGEN} ${DSN} ${SCHEMA} ${OUT} RESULT_VARIABLE rc)
+string(REPLACE "|" ";" args "${ARGS}")
+execute_process(COMMAND ${TABLEGEN} ${DSN} ${SCHEMA} ${OUT} ${args} RESULT_VARIABLE rc)
 if(NOT rc EQUAL 0)
   message(FATAL_ERROR "pg_tablegen failed on ${SCHEMA}")
 endif()
@@ -21,11 +24,18 @@ if(DEFINED PSQL)
   endif()
 endif()
 
-if(DEFINED EXPECTED)
-  execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files ${EXPECTED} ${OUT} RESULT_VARIABLE rc)
+function(expect_same expected actual)
+  execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files ${expected} ${actual} RESULT_VARIABLE rc)
   if(NOT rc EQUAL 0)
-    message(FATAL_ERROR "${OUT} differs from ${EXPECTED}")
+    message(FATAL_ERROR "${actual} differs from ${expected}")
   endif()
+endfunction()
+
+if(DEFINED EXPECTED)
+  expect_same(${EXPECTED} ${OUT})
+endif()
+if(DEFINED EXPECTED_QUERIES)
+  expect_same(${EXPECTED_QUERIES} ${QUERIES_OUT})
 endif()
 
 if(DEFINED CXX)

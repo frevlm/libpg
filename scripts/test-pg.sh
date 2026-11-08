@@ -2,11 +2,18 @@
 # A throwaway PostgreSQL for ctest: `start` makes a fresh cluster in DIR and
 # serves it on 127.0.0.1:PORT with a database libpg_test, `stop` ends it and
 # removes DIR. BINDIR holds initdb and pg_ctl.
+# `recreate URI DB BINDIR` instead drops and creates database DB on an
+# existing server (URI has no database); BINDIR holds psql.
 set -eu
 
 if [ $# -ne 4 ]; then
-  echo "usage: $0 start|stop DIR PORT BINDIR" >&2
+  echo "usage: $0 start|stop DIR PORT BINDIR | recreate URI DB BINDIR" >&2
   exit 2
+fi
+if [ "$1" = recreate ]; then
+  "$4/psql" -X -q -v ON_ERROR_STOP=1 -d "$2/postgres" \
+    -c "DROP DATABASE IF EXISTS $3 WITH (FORCE)" -c "CREATE DATABASE $3"
+  exit
 fi
 action=$1 dir=$2 port=$3 bin=$4
 # On macOS the postmaster refuses to start without a valid LC_ALL.
