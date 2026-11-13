@@ -1,11 +1,8 @@
 -- Covers every type pg_tablegen maps, plus keys, nullability, defaults,
--- identity and generated columns, and awkward names. users.ip has no builtin
--- mapping: the tests pass --override users.ip=std::string.
+-- identity and generated columns, domains, and awkward names.
 CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
 
 CREATE SEQUENCE ticket_seq;
-
-CREATE TYPE mood AS ENUM ('calm', 'busy');
 
 CREATE TABLE users (
     id       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -18,16 +15,13 @@ CREATE TABLE users (
     score    DOUBLE PRECISION,
     balance  NUMERIC(12, 2) NOT NULL DEFAULT 0,
     profile  JSONB NOT NULL DEFAULT '{}',
-    raw      JSON,
     joined   TIMESTAMPTZ NOT NULL DEFAULT now(),
     birthday DATE,
     ratio    REAL,
-    ip       INET,
     uid      UUID NOT NULL DEFAULT gen_random_uuid(),
     avatar   BYTEA,
     stake    NUMERIC(18, 6) NOT NULL DEFAULT 0,
-    big      NUMERIC,
-    mood     mood,
+    mood     TEXT,
     level    INTEGER GENERATED ALWAYS AS (rank * 2) STORED
 );
 

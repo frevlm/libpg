@@ -3,8 +3,11 @@
 #include <libpq-fe.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -15,8 +18,8 @@
 #include <tuple>
 #include <vector>
 
-#include "../src/writeback.hpp"
 #include "pg/pg.hpp"
+#include "pg/writeback.hpp"
 
 using namespace std::chrono_literals;
 using pg::sql;
@@ -40,11 +43,30 @@ struct points {
     using pg_type = std::int64_t;
     static constexpr std::string_view pg_name = "points";
 };
-struct balance_id {
+struct hits {
     using pg_table = balances;
-    using pg_type = std::int64_t;
-    static constexpr std::string_view pg_name = "id";
+    using pg_type = std::int32_t;
+    static constexpr std::string_view pg_name = "hits";
 };
+struct tiny {
+    using pg_table = balances;
+    using pg_type = pg::decimal<18>;
+    static constexpr std::string_view pg_name = "tiny";
+};
+// Two write shapes of one table that give `points` different C++ types.
+template <class T>
+struct points_write {
+    using pg_table = balances;
+    std::int64_t id{};
+    T points{};
+    static constexpr std::array<std::string_view, 2> pg_names{"id", "points"};
+    template <class F>
+    void pg_each(F&& f) const {
+        f(id);
+        f(points);
+    }
+};
+static_assert(pg::write_shape<points_write<std::int32_t>>);
 struct stock {
     static constexpr std::string_view name = "wb_stock";
     using key = std::tuple<std::int32_t, std::string>;
@@ -100,6 +122,7 @@ pg::pool& db() {
         run_admin("CREATE DATABASE " + database);
         pg::pool_options o;
         o.dsn = dsn_for(database);
+        o.max_conns = 12;
         return o;
     }());
     return p;
@@ -117,47 +140,27 @@ T scalar(const sql& q) {
 }
 
 constexpr std::string_view schema = R"SQL(
-CREATE TABLE wb_balances (id int8 PRIMARY KEY, amount numeric(18,6) NOT NULL DEFAULT 0, points int8 NOT NULL DEFAULT 0);
+CREATE TABLE wb_balances (id int8 PRIMARY KEY, amount numeric(18,6) NOT NULL DEFAULT 0, points int8 NOT NULL DEFAULT 0,
+                          hits int4 NOT NULL DEFAULT 0, tiny numeric(19,18) NOT NULL DEFAULT 0);
 CREATE TABLE wb_stock (warehouse int4, sku text, qty int8 NOT NULL, PRIMARY KEY (warehouse, sku));
 CREATE TABLE wb_ledger (id bigserial PRIMARY KEY, account int8 NOT NULL, amount numeric(18,6) NOT NULL CHECK (amount > 0),
                         memo text, meta jsonb);
-INSERT INTO wb_balances VALUES (1, 10, 0), (2, 20, 0), (3, 30, 0), (4, 40, 0);
+INSERT INTO wb_balances (id, amount) VALUES (1, 10), (2, 20), (3, 30), (4, 40);
 INSERT INTO wb_stock VALUES (1, 'a b', 5), (2, 'é"x', 6);
 )SQL";
 
-// A fresh schema made by pg::migrate, with the three counters watched.
 void reset() {
     run(sql{"DROP SCHEMA IF EXISTS libpg CASCADE"});
     run(sql{"DROP TABLE IF EXISTS wb_balances, wb_stock, wb_ledger"});
-    pg::migrate_options o;
-    o.migrations = {{"001_schema", schema}};
-    o.watched = {pg::watch<amount>(), pg::watch<points>(), pg::watch<qty>()};
-    pg::migrate(db(), o);
+    pg::conn c(db());
+    PQexec(c.raw(), std::string(schema).c_str());
 }
 
 dec d(std::string_view text) { return dec::parse(text); }
 
 dec db_amount(std::int64_t id) { return scalar<dec>(sql{"SELECT amount FROM wb_balances WHERE id = {}", id}); }
 std::int64_t db_points(std::int64_t id) { return scalar<std::int64_t>(sql{"SELECT points FROM wb_balances WHERE id = {}", id}); }
-
-// A hundred ledger postings, enough for one COPY group; `bad_row` gets a
-// negative amount that its CHECK rejects.
-void submit_ledger(pg::writeback& wb, int bad_row = -1) {
-    for (int i = 0; i < 100; ++i) {
-        ledger_write r{};
-        r.account = 1 + i % 4;
-        r.amount = i == bad_row ? d("-1") : d("1");
-        if (i % 3) r.memo = "m" + std::to_string(i);
-        if (i % 2) r.meta = pg::jsonb{"{\"i\": " + std::to_string(i) + "}"};
-        wb.submit(pg::posting{}.insert(r).add<amount>(d("1"), 1 + i % 4));
-    }
-}
-
-// db_amount of each balance after the hundred postings added 25 to it.
-void check_balances_plus_25() {
-    const std::array<dec, 4> initial{d("10"), d("20"), d("30"), d("40")};
-    for (std::int64_t id = 1; id <= 4; ++id) CHECK(db_amount(id) == initial[id - 1] + d("25"));
-}
+std::int64_t receipts() { return scalar<std::int64_t>(sql{"SELECT count(*) FROM libpg.flush_receipts"}); }
 
 // Options for a writeback that only writes on flush().
 pg::writeback_options manual() {
@@ -194,66 +197,28 @@ bool eventually(F f, std::chrono::milliseconds limit = 10s) {
 
 }  // namespace
 
-TEST_CASE("notification payloads parse, escapes included", "[writeback]") {
-    const auto n = pg::detail::parse_notice(R"({"t":"wb_stock","c":"qty","k":[["1","a\"b\\cé😀"],["2","x"]]})");
-    REQUIRE(n.has_value());
-    CHECK(n->table == "wb_stock");
-    CHECK(n->column == "qty");
-    REQUIRE(n->keys.size() == 2);
-    CHECK(n->keys[0] == std::vector<std::string>{"1", "a\"b\\c\xc3\xa9\xf0\x9f\x98\x80"});
-    CHECK(n->keys[1] == std::vector<std::string>{"2", "x"});
-    CHECK(pg::detail::parse_notice(R"({"t":"x","c":"y","k":[["1"]})") == std::nullopt);
-    const auto all = pg::detail::parse_notice(R"({"t":"wb_stock","c":"qty","all":true})");
-    REQUIRE(all.has_value());
-    CHECK(all->all);
-}
-
-TEST_CASE("add, get and flush", "[writeback]") {
+TEST_CASE("submit, get and flush with integer, decimal and composite-key counters", "[writeback]") {
     reset();
     pg::writeback wb(db(), manual());
     CHECK(wb.get<amount>(1) == d("10"));
-    wb.submit(pg::posting{}.add<amount>(d("2.5"), 1).add<qty>(3, 1, "a b").add<qty>(-1, 2, "é\"x"));
+    wb.submit(pg::posting{}.add<amount>(d("2.5"), 1).add<qty>(3, 1, "a b").add<qty>(-1, 2, "é\"x").add<hits>(4, 1).add<hits>(-1, 1));
     CHECK(wb.get<amount>(1) == d("12.5"));
+    CHECK(wb.get<hits>(1) == 3);
     CHECK(db_amount(1) == d("10"));
     CHECK(wb.stats().backlog == 1);
     wb.flush();
     CHECK(db_amount(1) == d("12.5"));
+    CHECK(scalar<std::int32_t>(sql{"SELECT hits FROM wb_balances WHERE id = 1"}) == 3);
     CHECK(scalar<std::int64_t>(sql{"SELECT qty FROM wb_stock WHERE warehouse = 1"}) == 8);
     CHECK(scalar<std::int64_t>(sql{"SELECT qty FROM wb_stock WHERE warehouse = 2"}) == 5);
     CHECK(wb.get<qty>(2, "é\"x") == 5);
     CHECK(wb.stats().backlog == 0);
     CHECK(wb.stats().committed == 1);
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM libpg.flush_receipts"}) == 1);
+    CHECK(receipts() == 1);
     REQUIRE_THROWS_AS(wb.get<amount>(99), pg::not_found);
 }
 
-TEST_CASE("cached reads and adds like a variable", "[writeback]") {
-    reset();
-    pg::writeback wb(db(), manual());
-
-    pg::cached<amount> b(wb, std::int64_t{1});
-    CHECK(b.get() == wb.get<amount>(1));
-    CHECK(b.get() == d("10"));
-
-    b += d("2.5");
-    b -= d("0.5");
-    CHECK(b.get() == d("12"));
-    CHECK(wb.get<amount>(1) == d("12"));
-
-    wb.flush();
-    CHECK(db_amount(1) == d("12"));
-
-    pg::cached<qty> q(wb, 1, std::string("a b"));
-    CHECK(q.get() == wb.get<qty>(1, "a b"));
-    CHECK(q.get() == 5);
-    q += 3;
-    q -= 1;
-    CHECK(q.get() == 7);
-    wb.flush();
-    CHECK(scalar<std::int64_t>(sql{"SELECT qty FROM wb_stock WHERE warehouse = 1 AND sku = 'a b'"}) == 7);
-}
-
-TEST_CASE("a posting commits whole or is lost whole", "[writeback]") {
+TEST_CASE("a posting commits whole or is lost whole while the rest of its batch commits", "[writeback]") {
     reset();
     lost_log lost;
     auto o = manual();
@@ -272,7 +237,7 @@ TEST_CASE("a posting commits whole or is lost whole", "[writeback]") {
 
     const auto l = lost.get();
     REQUIRE(l.size() == 1);
-    CHECK(l[0].kind == pg::error_kind::data);
+    INFO(l[0].reason); CHECK(l[0].kind == pg::error_kind::data);
     CHECK(l[0].reason.find("23514") != std::string::npos);
     CHECK(l[0].description.size() == 3);
     CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM wb_ledger"}) == 1);
@@ -287,250 +252,296 @@ TEST_CASE("a posting commits whole or is lost whole", "[writeback]") {
     CHECK(st.backlog == 0);
 }
 
-TEST_CASE("a batch whose result was lost after commit is replayed and counted once", "[writeback]") {
-    reset();
-    pg::writeback wb(db(), manual());
-    wb.submit(pg::posting{}.add<points>(5, 3));
-    pg::detail::inject_fault(wb, pg::detail::wb_fault::lost_after_commit);
-    wb.flush();
-    CHECK(db_points(3) == 5);
-    CHECK(wb.get<points>(3) == 5);
-    CHECK(wb.stats().replays == 1);
-    CHECK(wb.stats().committed == 1);
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM libpg.flush_receipts"}) == 1);
-}
-
-TEST_CASE("a large batch inserts its rows by COPY", "[writeback]") {
-    reset();
-    pg::writeback wb(db(), manual());
-    submit_ledger(wb);
-    pg::detail::inject_fault(wb, pg::detail::wb_fault::lost_after_copy);
-    wb.flush();
-    CHECK(wb.stats().replays == 1);  // the COPY path ran and was lost; the batch was replayed
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM wb_ledger"}) == 100);
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(memo) FROM wb_ledger"}) == 66);
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(meta) FROM wb_ledger"}) == 50);
-    CHECK(scalar<dec>(sql{"SELECT sum(amount) FROM wb_ledger"}) == d("100"));
-    CHECK(scalar<std::int64_t>(sql{"SELECT min((meta->>'i')::int8) FROM wb_ledger"}) == 1);
-    check_balances_plus_25();
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM libpg.flush_receipts"}) == 1);
-    CHECK(wb.stats().committed == 100);
-}
-
-TEST_CASE("a large batch lost after commit is replayed and counted once", "[writeback]") {
-    reset();
-    pg::writeback wb(db(), manual());
-    submit_ledger(wb);
-    pg::detail::inject_fault(wb, pg::detail::wb_fault::lost_after_commit);
-    wb.flush();
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM wb_ledger"}) == 100);
-    CHECK(wb.stats().replays == 1);
-    check_balances_plus_25();
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM libpg.flush_receipts"}) == 1);
-}
-
-TEST_CASE("a large batch with a bad row loses only that posting", "[writeback]") {
+TEST_CASE("a delta to a row that does not exist is lost and reverted", "[writeback]") {
     reset();
     lost_log lost;
     auto o = manual();
     o.on_lost = lost.sink();
     pg::writeback wb(db(), o);
-    submit_ledger(wb, 37);
+    wb.submit(pg::posting{}.add<points>(1, 77));
+    wb.submit(pg::posting{}.add<points>(2, 1));
     wb.flush();
-    const auto l = lost.get();
-    REQUIRE(l.size() == 1);
-    CHECK(l[0].kind == pg::error_kind::data);
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM wb_ledger"}) == 99);
-    CHECK(wb.stats().committed == 99);
-    const std::array<dec, 4> initial{d("10"), d("20"), d("30"), d("40")};
-    for (std::int64_t id = 1; id <= 4; ++id) CHECK(db_amount(id) == initial[id - 1] + d(id == 2 ? "24" : "25"));
+    REQUIRE(lost.get().size() == 1);
+    CHECK(lost.get()[0].kind == pg::error_kind::data);
+    CHECK(db_points(1) == 2);
+    REQUIRE_THROWS_AS(wb.get<points>(77), pg::not_found);
 }
 
-TEST_CASE("a batch lost before it was sent is replayed", "[writeback]") {
+TEST_CASE("inserted rows with different column sets are written by their own statements", "[writeback]") {
     reset();
     pg::writeback wb(db(), manual());
-    wb.submit(pg::posting{}.add<points>(4, 3));
-    pg::detail::inject_fault(wb, pg::detail::wb_fault::lost_before_send);
+    ledger_write a{.account = 1, .amount = d("1")};
+    ledger_write b{.id = 500, .account = 2, .amount = d("2"), .memo = "m"};
+    ledger_write c{.account = 3, .amount = d("3"), .meta = pg::jsonb{"{}"}};
+    wb.submit(pg::posting{}.insert(a));
+    wb.submit(pg::posting{}.insert(b).insert(c));
     wb.flush();
-    CHECK(db_points(3) == 4);
-    CHECK(wb.stats().replays == 1);
-    CHECK(wb.stats().committed == 1);
+    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM wb_ledger"}) == 3);
+    CHECK(scalar<std::string>(sql{"SELECT memo FROM wb_ledger WHERE id = 500"}) == "m");
+    CHECK(scalar<std::int64_t>(sql{"SELECT count(meta) FROM wb_ledger"}) == 1);
 }
 
-TEST_CASE("a delta to a deleted row loses its posting", "[writeback]") {
+TEST_CASE("many threads submit to hot and spread keys and the database ends exact", "[writeback]") {
     reset();
-    lost_log lost;
-    auto o = manual();
-    o.on_lost = lost.sink();
+    run(sql{"INSERT INTO wb_balances (id) SELECT g FROM generate_series(100, 163) g"});
+    pg::writeback_options o;
+    o.interval = 20ms;
     pg::writeback wb(db(), o);
-    CHECK(wb.get<points>(2) == 0);
-    run(sql{"DELETE FROM wb_balances WHERE id = 2"});
-    wb.submit(pg::posting{}.add<points>(1, 2).add<points>(1, 1));
-    wb.submit(pg::posting{}.add<points>(3, 1));
-    CHECK(wb.get<points>(2) == 1);
+    constexpr int threads = 8, rounds = 400;
+    std::vector<std::thread> ts;
+    for (int t = 0; t < threads; ++t)
+        ts.emplace_back([&, t] {
+            for (int i = 0; i < rounds; ++i) {
+                wb.submit(pg::posting{}.add<points>(1, 1).add<amount>(d("0.5"), 100 + (t * 7 + i) % 64).add<hits>(1, 2));
+                if (i % 50 == 0) (void)wb.get<points>(100 + i % 64);
+            }
+        });
+    for (auto& t : ts) t.join();
     wb.flush();
-    const auto l = lost.get();
-    REQUIRE(l.size() == 1);
-    CHECK(l[0].reason == "wb_balances.points: the row of a delta does not exist");
-    CHECK(db_points(1) == 3);
-    CHECK(wb.get<points>(1) == 3);
-    CHECK(wb.get<points>(2) == 0);
+    CHECK(db_points(1) == threads * rounds);
+    CHECK(scalar<std::int32_t>(sql{"SELECT hits FROM wb_balances WHERE id = 2"}) == threads * rounds);
+    CHECK(scalar<dec>(sql{"SELECT sum(amount) FROM wb_balances WHERE id >= 100"}) == d("1600"));
+    CHECK(wb.get<points>(1) == threads * rounds);
+    CHECK(wb.stats().committed == threads * rounds);
+    CHECK(wb.stats().backlog == 0);
 }
 
 TEST_CASE("over the backlog limit submit throws and records nothing", "[writeback]") {
     reset();
     auto o = manual();
-    o.backlog_limit = 2;
+    o.backlog_limit = 3;
     pg::writeback wb(db(), o);
+    CHECK(wb.get<points>(1) == 0);
+    for (int i = 0; i < 3; ++i) wb.submit(pg::posting{}.add<points>(1, 1));
+    REQUIRE_THROWS_AS(wb.submit(pg::posting{}.add<points>(100, 1)), pg::backlog_full);
+    CHECK(wb.get<points>(1) == 3);
+    CHECK(wb.stats().backlog == 3);
+    wb.flush();
+    CHECK(db_points(1) == 3);
     wb.submit(pg::posting{}.add<points>(1, 1));
-    wb.submit(pg::posting{}.add<points>(1, 1));
-    REQUIRE_THROWS_AS(wb.submit(pg::posting{}.add<points>(1, 1)), pg::backlog_full);
-    CHECK(wb.stats().backlog == 2);
-    CHECK(wb.get<points>(1) == 2);
+    wb.flush();
+    CHECK(db_points(1) == 4);
+}
+
+TEST_CASE("an empty posting is not recorded", "[writeback]") {
+    reset();
+    pg::writeback wb(db(), manual());
+    wb.submit(pg::posting{});
     wb.flush();
     CHECK(wb.stats().backlog == 0);
-    CHECK(db_points(1) == 2);
+    CHECK(receipts() == 0);
+}
+
+TEST_CASE("a batch lost before it was sent is replayed", "[writeback]") {
+    reset();
+    pg::writeback wb(db(), manual());
+    wb.submit(pg::posting{}.add<points>(5, 3));
+    pg::detail::inject_fault(wb, 1);
+    wb.flush();
+    CHECK(db_points(3) == 5);
+    CHECK(wb.stats().replays == 1);
+    CHECK(wb.stats().committed == 1);
+    CHECK(receipts() == 1);
+}
+
+TEST_CASE("a batch lost after commit is replayed and counted once", "[writeback]") {
+    reset();
+    ledger_write r{.account = 1, .amount = d("1")};
+    pg::writeback wb(db(), manual());
+    wb.submit(pg::posting{}.insert(r).add<points>(5, 3).add<amount>(d("1.5"), 3));
+    pg::detail::inject_fault(wb, 2);
+    wb.flush();
+    CHECK(db_points(3) == 5);
+    CHECK(db_amount(3) == d("31.5"));
+    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM wb_ledger"}) == 1);
+    CHECK(wb.get<points>(3) == 5);
+    CHECK(wb.stats().replays == 1);
+    CHECK(wb.stats().committed == 1);
+    CHECK(receipts() == 1);
+}
+
+TEST_CASE("a slot read since it was loaded is re-read after refresh", "[writeback]") {
+    reset();
+    pg::writeback_options o;
+    o.interval = 20ms;
+    o.refresh = 100ms;
+    pg::writeback wb(db(), o);
+    CHECK(wb.get<points>(1) == 0);
+    run(sql{"UPDATE wb_balances SET points = 40 WHERE id = 1"});
+    CHECK(eventually([&] { return wb.get<points>(1) == 40; }, o.refresh + o.interval + 2s));
+    wb.submit(pg::posting{}.add<points>(2, 1));
+    wb.flush();
+    run(sql{"UPDATE wb_balances SET points = 100 WHERE id = 1"});
+    CHECK(eventually([&] { return wb.get<points>(1) == 100; }, 3s));
+}
+
+TEST_CASE("a slot nobody reads is evicted and loaded again", "[writeback]") {
+    reset();
+    pg::writeback_options o;
+    o.interval = 20ms;
+    o.refresh = 100ms;
+    pg::writeback wb(db(), o);
+    CHECK(wb.get<points>(1) == 0);
+    std::this_thread::sleep_for(600ms);
+    run(sql{"UPDATE wb_balances SET points = 9 WHERE id = 1"});
+    CHECK(wb.get<points>(1) == 9);
 }
 
 TEST_CASE("the destructor flushes", "[writeback]") {
     reset();
     {
         pg::writeback wb(db(), manual());
-        wb.submit(pg::posting{}.add<amount>(d("0.000001"), 4));
+        wb.submit(pg::posting{}.add<points>(6, 4).add<qty>(2, 1, "a b"));
     }
-    CHECK(db_amount(4) == d("40.000001"));
+    CHECK(db_points(4) == 6);
+    CHECK(scalar<std::int64_t>(sql{"SELECT qty FROM wb_stock WHERE warehouse = 1"}) == 7);
 }
 
-TEST_CASE("reconcile() reads every loaded slot again", "[writeback]") {
+
+TEST_CASE("a failed refresh does not drop the batch", "[writeback]") {
     reset();
-    pg::writeback wb(db(), manual());
-    CHECK(wb.get<points>(1) == 0);
-    wb.submit(pg::posting{}.add<points>(2, 1));
-    run(sql{"UPDATE wb_balances SET points = 100 WHERE id = 1"});
-    wb.reconcile();
-    CHECK(wb.get<points>(1) == 102);
-    CHECK(wb.stats().full_reconciles == 1);
+    auto o = manual();
+    o.interval = 50ms;
+    o.refresh = 100ms;
+    pg::writeback wb(db(), o);
+    CHECK(wb.get<qty>(1, "a b") == 5);
+    std::atomic<bool> stop{false};
+    std::thread reader([&] {
+        while (!stop) {
+            (void)wb.get<qty>(1, "a b");
+            std::this_thread::sleep_for(10ms);
+        }
+    });
+    std::this_thread::sleep_for(300ms);
+    run(sql{"ALTER TABLE wb_stock RENAME COLUMN qty TO qty2"});
+    wb.submit(pg::posting{}.add<points>(7, 1));
+    wb.flush();
+    run(sql{"ALTER TABLE wb_stock RENAME COLUMN qty2 TO qty"});
+    stop = true;
+    reader.join();
+    CHECK(db_points(1) == 7);
+    CHECK(wb.stats().committed == 1);
+    CHECK(wb.stats().lost == 0);
 }
 
-TEST_CASE("replicas see each other's commits and admin writes", "[writeback]") {
+TEST_CASE("an acquire timeout replays the batch instead of losing it", "[writeback]") {
     reset();
-    pg::writeback a(db(), manual());
-    pg::writeback b(db(), manual());
-    a.watch<amount>();
-    b.watch<amount>();
-    REQUIRE(eventually([&] { return a.stats().full_reconciles >= 1 && b.stats().full_reconciles >= 1; }));
-    CHECK(a.get<amount>(1) == d("10"));
-    CHECK(b.get<amount>(1) == d("10"));
-
-    b.submit(pg::posting{}.add<amount>(d("1"), 1));
-    a.submit(pg::posting{}.add<amount>(d("100"), 1));
-    a.flush();
-    REQUIRE(eventually([&] { return b.stats().reconciled >= 1; }));
-    CHECK(b.get<amount>(1) == d("111"));  // database 110 + b's unsettled 1
-    CHECK(a.get<amount>(1) == d("110"));
-    REQUIRE(eventually([&] { return a.stats().ignored >= 1; }));
-    CHECK(a.stats().reconciled == 0);
-
-    b.flush();
-    REQUIRE(eventually([&] { return a.stats().reconciled >= 1; }));
-    CHECK(a.get<amount>(1) == d("111"));
-
-    run(sql{"UPDATE wb_balances SET amount = amount + 7 WHERE id = 1"});
-    REQUIRE(eventually([&] { return a.stats().reconciled >= 2 && b.stats().reconciled >= 2; }));
-    CHECK(a.get<amount>(1) == d("118"));
-    CHECK(b.get<amount>(1) == d("118"));
-}
-
-TEST_CASE("a listener reconnect reconciles everything", "[writeback]") {
-    reset();
-    pg::writeback wb(db(), manual());
-    wb.watch<points>();
-    REQUIRE(eventually([&] { return wb.stats().full_reconciles >= 1; }));
-    CHECK(wb.get<points>(1) == 0);
+    pg::pool_options po;
+    po.dsn = dsn_for(database);
+    po.max_conns = 1;
+    po.acquire_timeout = 200ms;
+    pg::pool p(po);
+    lost_log lost;
+    auto o = manual();
+    o.on_lost = lost.sink();
+    pg::writeback wb(p, o);
     {
+        pg::conn c(p);
+        pg::transaction tx(c);
+        c.exec(sql{"SELECT 1"});
+        wb.submit(pg::posting{}.add<points>(3, 1));
+        auto f = std::async(std::launch::async, [&] { wb.flush(); });
+        std::this_thread::sleep_for(600ms);
+        tx.commit();
+        f.get();
+    }
+    CHECK(lost.get().empty());
+    CHECK(db_points(1) == 3);
+    CHECK(wb.stats().replays > 0);
+}
+
+TEST_CASE("decimal deltas of 18 digits reach the database exactly", "[writeback]") {
+    reset();
+    using dec18 = pg::decimal<18>;
+    {
+        pg::writeback wb(db(), manual());
+        wb.submit(pg::posting{}.add<tiny>(dec18::parse("1.234567890123456789"), 1));
+        wb.submit(pg::posting{}.add<tiny>(dec18::parse("7.000000000000000001"), 1));
+        wb.flush();
+    }
+    CHECK(scalar<std::string>(sql{"SELECT tiny::text FROM wb_balances WHERE id = 1"}) == "8.234567890123456790");
+    pg::writeback wb(db(), manual());
+    CHECK(wb.get<tiny>(1) == dec18::parse("8.23456789012345679"));
+}
+
+TEST_CASE("a batch holds at most 10000 postings", "[writeback]") {
+    reset();
+    pg::writeback wb(db(), manual());
+    for (int i = 0; i < 25'000; ++i) wb.submit(pg::posting{}.add<points>(1, 1));
+    wb.flush();
+    CHECK(db_points(1) == 25'000);
+    CHECK(receipts() == 3);
+    CHECK(wb.stats().committed == 25'000);
+}
+
+TEST_CASE("a batch that keeps hitting a lock is halved and loads are not blocked meanwhile", "[writeback]") {
+    reset();
+    pg::pool_options po;
+    po.dsn = dsn_for(database) + "?options=-c%20lock_timeout%3D100ms";
+    po.max_conns = 4;
+    pg::pool p(po);
+    pg::writeback wb(p, manual());
+    std::thread locker([] {
         pg::conn c(db());
         pg::transaction tx(c);
-        c.exec(sql{"SET LOCAL session_replication_role = replica"});  // no trigger, no notification
-        c.exec(sql{"UPDATE wb_balances SET points = 50 WHERE id = 1"});
+        c.exec(sql{"SELECT 1 FROM wb_balances WHERE id = 1 FOR UPDATE"});
+        std::this_thread::sleep_for(3s);
         tx.commit();
-    }
-    CHECK(wb.get<points>(1) == 0);
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
-                                   "WHERE datname = current_database() AND query LIKE 'LISTEN%'"}) == 1);
-    REQUIRE(eventually([&] { return wb.stats().full_reconciles >= 2; }));
-    CHECK(wb.get<points>(1) == 50);
+    });
+    std::this_thread::sleep_for(200ms);
+    wb.submit(pg::posting{}.add<points>(1, 2));
+    wb.submit(pg::posting{}.add<points>(1, 1));
+    auto f = std::async(std::launch::async, [&] { wb.flush(); });
+    CHECK(eventually([] { return db_points(2) == 1; }, 2s));
+    CHECK(db_points(1) == 0);
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(wb.get<points>(3) == 0);
+    CHECK(std::chrono::steady_clock::now() - t0 < 1s);
+    locker.join();
+    f.get();
+    CHECK(db_points(1) == 1);
+    CHECK(wb.stats().lost == 0);
 }
 
-TEST_CASE("receipts older than a day are deleted", "[writeback]") {
+TEST_CASE("a commit of unknown outcome that meets the shutdown is settled by its receipt", "[writeback]") {
     reset();
-    run(sql{"INSERT INTO libpg.flush_receipts VALUES (gen_random_uuid(), now() - interval '2 days'), "
-            "(gen_random_uuid(), now() - interval '1 hour')"});
-    pg::writeback wb(db(), manual());
-    wb.flush();
-    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM libpg.flush_receipts"}) == 1);
-}
-
-TEST_CASE("concurrent submits add up", "[writeback]") {
-    reset();
-    auto o = pg::writeback_options{};
-    o.interval = 20ms;
-    pg::writeback wb(db(), o);
-    constexpr int threads = 8, per_thread = 10'000;
-    std::vector<std::thread> ts;
-    for (int t = 0; t < threads; ++t) {
-        ts.emplace_back([&wb, t] {
-            for (int i = 0; i < per_thread; ++i) {
-                const std::int64_t id = (t + i) % 4 + 1;
-                wb.submit(pg::posting{}.add<points>(1, id).add<amount>(dec::from_units(1), id));
-            }
+    lost_log lost;
+    std::thread locker;
+    {
+        auto o = manual();
+        o.shutdown_timeout = 50ms;
+        o.on_lost = lost.sink();
+        pg::writeback wb(db(), o);
+        locker = std::thread([] {
+            pg::conn c(db());
+            pg::transaction tx(c);
+            c.exec(sql{"SELECT 1 FROM wb_balances WHERE id = 1 FOR UPDATE"});
+            std::this_thread::sleep_for(400ms);
+            tx.commit();
         });
+        std::this_thread::sleep_for(100ms);
+        wb.submit(pg::posting{}.add<points>(5, 1));
+        pg::detail::inject_fault(wb, 2);
     }
-    for (auto& t : ts) t.join();
+    locker.join();
+    CHECK(lost.get().empty());
+    CHECK(db_points(1) == 5);
+}
+
+TEST_CASE("get inside a transaction of the pool throws for hot and cold keys alike", "[writeback]") {
+    reset();
+    pg::writeback wb(db(), manual());
+    CHECK(wb.get<points>(1) == 0);
+    for (const std::int64_t id : {1, 2})
+        REQUIRE_THROWS_AS(db().transact([&](pg::conn& c) { return c.exec(sql{"SELECT 1"}), wb.get<points>(id); }), pg::nested_borrow);
+}
+
+TEST_CASE("write shapes with different types for a column are inserted by their own statements", "[writeback]") {
+    reset();
+    pg::writeback wb(db(), manual());
+    wb.submit(pg::posting{}.insert(points_write<std::int64_t>{.id = 10, .points = 1}).insert(points_write<std::int32_t>{.id = 11, .points = 2}));
     wb.flush();
-    std::int64_t total = 0;
-    for (std::int64_t id = 1; id <= 4; ++id) {
-        CHECK(wb.get<points>(id) == db_points(id));
-        CHECK(wb.get<amount>(id) == db_amount(id));
-        total += db_points(id);
-    }
-    CHECK(total == threads * per_thread);
-    CHECK(scalar<dec>(sql{"SELECT sum(amount) FROM wb_balances"}) == d("100.080000"));
-    CHECK(wb.stats().committed == threads * per_thread);
-}
-
-TEST_CASE("a TRUNCATE reconciles every loaded slot of the counter", "[writeback]") {
-    reset();
-    pg::writeback wb(db(), manual());
-    wb.watch<qty>();
-    REQUIRE(eventually([&] { return wb.stats().full_reconciles >= 1; }));
-    CHECK(wb.get<qty>(1, "a b") == 5);
-    run(sql{"TRUNCATE wb_stock"});
-    REQUIRE(eventually([&] { return wb.stats().reconciled >= 1; }));
-    REQUIRE_THROWS_AS(wb.get<qty>(1, "a b"), pg::not_found);
-}
-
-TEST_CASE("watch on a column migrate did not register throws", "[writeback]") {
-    reset();
-    pg::writeback wb(db(), manual());
-    try {
-        wb.watch<balance_id>();
-        FAIL("watch did not throw");
-    } catch (const pg::error& e) {
-        CHECK(e.kind == pg::error_kind::other);
-        CHECK(std::string(e.what()) ==
-              "writeback: wb_balances.id is not watched; add pg::watch<Col>() to migrate_options::watched and run pg::migrate");
-    }
-}
-
-TEST_CASE("watch before any migrate throws", "[writeback]") {
-    run(sql{"DROP SCHEMA IF EXISTS libpg CASCADE"});
-    pg::writeback wb(db(), manual());
-    try {
-        wb.watch<amount>();
-        FAIL("watch did not throw");
-    } catch (const pg::error& e) {
-        CHECK(e.kind == pg::error_kind::other);
-        CHECK(std::string(e.what()) ==
-              "writeback: wb_balances.amount is not watched; add pg::watch<Col>() to migrate_options::watched and run pg::migrate");
-    }
+    CHECK(db_points(10) == 1);
+    CHECK(db_points(11) == 2);
+    CHECK(receipts() == 1);
 }

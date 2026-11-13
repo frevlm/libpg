@@ -1,8 +1,6 @@
 // Library scenarios: pooled queries, single-cell updates, transactions, and the
 // pool itself.
-#include <array>
 #include <latch>
-#include <string_view>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -23,7 +21,6 @@ pg::sql select_account(std::int64_t id) { return pg::sql{"SELECT name, balance F
 pg::pool_options pool_of(const Cfg& cfg, int size) {
     pg::pool_options o;
     o.dsn = cfg.dsn;
-    o.pooler = cfg.pooler;
     o.max_conns = size;
     return o;
 }
@@ -90,33 +87,6 @@ void update_cells(const Cfg& cfg, const char* name, std::int64_t rows) {
 void run_update_cell(const Cfg& cfg) { update_cells(cfg, "v1_update_cell", kRows); }
 void run_update_cell_hot(const Cfg& cfg) { update_cells(cfg, "v1_update_cell_hot", kHotRows); }
 
-// --- v2_cell_add / v2_cell_get: pg::cell on accounts.balance ------------------------
-
-struct accounts_tag {
-    static constexpr std::string_view name = "accounts";
-    using key = std::tuple<std::int64_t>;
-    static constexpr std::array<std::string_view, 1> key_columns{"id"};
-};
-struct balance_tag {
-    using pg_table = accounts_tag;
-    using pg_type = money;
-    static constexpr std::string_view pg_name = "balance";
-};
-
-void run_cell_add(const Cfg& cfg) {
-    sweep_pool(cfg, "v2_cell_add", [](pg::pool& p, Ctx& x) {
-        pg::conn c(p);
-        pg::cell<balance_tag>(c, x.rng.key()) += money::parse("1");
-    });
-}
-
-void run_cell_get(const Cfg& cfg) {
-    sweep_pool(cfg, "v2_cell_get", [](pg::pool& p, Ctx& x) {
-        pg::conn c(p);
-        x.sink += static_cast<std::uint64_t>(pg::cell<balance_tag>(c, x.rng.key()).get().units & 0xff);
-    });
-}
-
 // --- v1_tx3 -----------------------------------------------------------------------
 
 void run_tx3(const Cfg& cfg) {
@@ -154,15 +124,13 @@ void run_pool_contention(const Cfg& cfg) {
 
 }  // namespace
 
-void register_v1(std::vector<Scenario>& v) {
+void register_pool(std::vector<Scenario>& v) {
     v.push_back({"v1_select", run_select});
     v.push_back({"v1_select_hold", run_select_hold});
     v.push_back({"v1_update_cell", run_update_cell});
     v.push_back({"v1_update_cell_hot", run_update_cell_hot});
     v.push_back({"v1_tx3", run_tx3});
     v.push_back({"pool_contention", run_pool_contention});
-    v.push_back({"v2_cell_add", run_cell_add});
-    v.push_back({"v2_cell_get", run_cell_get});
 }
 
 }  // namespace bench

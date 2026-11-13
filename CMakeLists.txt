@@ -15,28 +15,21 @@ find_package(Threads REQUIRED)
 
 add_library(pg
   src/codec.cpp
-  src/engine.cpp
   src/error.cpp
-  src/libpg_schema.cpp
   src/migrate.cpp
   src/pool.cpp
-  src/prefetch.cpp
-  src/sha256.cpp
   src/sql.cpp
-  src/writeback.cpp
-  src/writeback_listen.cpp
-  src/writeback_writer.cpp
 )
 target_include_directories(pg PUBLIC include)
 target_compile_features(pg PUBLIC cxx_std_20)
 target_link_libraries(pg PUBLIC PostgreSQL::PostgreSQL Threads::Threads)
 target_compile_options(pg PRIVATE -Wall -Wextra -Wpedantic)
-# Uses the libpq 14-16 calls (PQpipelineSync, DEALLOCATE) even when newer ones exist,
-# to test that path.
-option(LIBPG_FORCE_LIBPQ16_PATH "Use the pre-libpq-17 code path of the engine" OFF)
-if(LIBPG_FORCE_LIBPQ16_PATH)
-  target_compile_definitions(pg PRIVATE LIBPG_FORCE_LIBPQ16_PATH)
-endif()
+
+# The write-back cache (include/pg/writeback.hpp): counters in memory, postings
+# written in batches by one background thread.
+add_library(pg_writeback src/writeback.cpp)
+target_link_libraries(pg_writeback PUBLIC pg)
+target_compile_options(pg_writeback PRIVATE -Wall -Wextra -Wpedantic)
 
 # Reads a schema.sql into a scratch schema of a live database and writes the
 # column tags of its tables (CONTEXT.md, 列标签).

@@ -1,9 +1,0 @@
--- Differs from schema.sql: balance has no CHECK and transfers.note is NOT NULL.
-ALTER TABLE accounts ADD COLUMN balance NUMERIC(12, 2) NOT NULL DEFAULT 0;
-
-CREATE TABLE transfers (
-    id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    source BIGINT NOT NULL REFERENCES accounts (id),
-    amount NUMERIC(12, 2) NOT NULL,
-    note   TEXT NOT NULL
-);

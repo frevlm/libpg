@@ -132,6 +132,8 @@ struct page_row {
     pg::timestamptz submit_time{};
     bool accepted{};
     static constexpr std::size_t pg_columns = 7;
+    static constexpr std::array<std::string_view, 7> pg_names{"id", "user_id", "problem_id", "submitter",
+                                                              "score", "submit_time", "accepted"};
     template <class F>
     void pg_each(F&& f) {
         f(id);
@@ -243,32 +245,20 @@ void poll_sent(pg::conn& c, Ctx& x) {
 
 using Handler = void (*)(pg::conn&, Ctx&);
 
-// With `prefetch`, the pool learns and prefetches (pool_options::prefetch) and
-// the result carries its prefetch counters.
-void run_handler(const Cfg& cfg, const char* name, Handler h, bool prefetch = false) {
+void run_handler(const Cfg& cfg, const char* name, Handler h) {
     for (int size : cfg.pools)
         for (int t : cfg.threads) {
             note(std::string(name) + " pool=" + std::to_string(size) + " threads=" + std::to_string(t));
             pg::pool_options o;
             o.dsn = cfg.dsn;
-            o.pooler = cfg.pooler;
             o.max_conns = size;
-            o.prefetch = prefetch;
             pg::pool p(o);
-            Result r = run_point(t, cfg.duration, [&](Ctx& x) {
-                x.loop([&] {
-                    pg::conn c(p);
-                    h(c, x);
-                });
-            });
-            if (prefetch) {
-                const pg::pool_stats s = p.stats();
-                if (!r.extra.empty()) r.extra += ';';
-                r.extra += "hits=" + std::to_string(s.prefetch_hits) + ";misses=" + std::to_string(s.prefetch_misses) +
-                          ";unused=" + std::to_string(s.prefetch_unused) +
-                          ";fail=" + std::to_string(s.prefetch_failures) + ";skip=" + std::to_string(s.prefetch_skips);
-            }
-            emit(name, t, size, r);
+            emit(name, t, size, run_point(t, cfg.duration, [&](Ctx& x) {
+                     x.loop([&] {
+                         pg::conn c(p);
+                         h(c, x);
+                     });
+                 }));
         }
 }
 
@@ -285,19 +275,6 @@ REAL_HANDLER(poll_serial, "real_poll_serial")
 REAL_HANDLER(poll_sent, "real_poll_sent")
 #undef REAL_HANDLER
 
-void run_me_auto(const Cfg& cfg) { run_handler(cfg, "real_me_auto", me_serial, true); }
-void run_list_auto(const Cfg& cfg) { run_handler(cfg, "real_list_auto", list_n1, true); }
-void run_poll_auto(const Cfg& cfg) { run_handler(cfg, "real_poll_auto", poll_serial, true); }
-
-// One point read per conn: nothing to prefetch, so the auto form measures what
-// observing and learning cost.
-void point(pg::conn& c, Ctx& x) {
-    x.sink += static_cast<std::uint64_t>(
-        c.query_one<std::int32_t>(pg::sql{"SELECT rating FROM oj_users WHERE id = {}", static_cast<std::int32_t>(x.rng.key(kOjUsers))}));
-}
-void run_point_off(const Cfg& cfg) { run_handler(cfg, "real_point_off", point); }
-void run_point_auto(const Cfg& cfg) { run_handler(cfg, "real_point_auto", point, true); }
-
 // 60% /api/auth/me, 30% list page, 10% judger poll.
 template <Handler Me, Handler List, Handler Poll>
 void mix(pg::conn& c, Ctx& x) {
@@ -309,9 +286,6 @@ void mix(pg::conn& c, Ctx& x) {
 
 void run_mix_serial(const Cfg& cfg) { run_handler(cfg, "real_mix_serial", mix<me_serial, list_n1, poll_serial>); }
 void run_mix_best(const Cfg& cfg) { run_handler(cfg, "real_mix_best", mix<me_one, list_join, poll_sent>); }
-void run_mix_auto(const Cfg& cfg) {
-    run_handler(cfg, "real_mix_auto", mix<me_serial, list_n1, poll_serial>, true);
-}
 
 // --- S4: revlm dashboard over the dense table ---------------------------------------
 
@@ -333,6 +307,10 @@ struct request_row {
     money usd{};
     std::optional<std::string> error{};
     static constexpr std::size_t pg_columns = 16;
+    static constexpr std::array<std::string_view, 16> pg_names{
+        "id",       "time",   "user_id",       "token_id",      "channel_id",    "model",
+        "endpoint", "request_id", "response_id", "status",      "input_tokens",  "output_tokens",
+        "cache_read_tokens", "latency_ms", "usd", "error"};
     template <class F>
     void pg_each(F&& f) {
         f(id);
@@ -379,7 +357,6 @@ void run_dash(const Cfg& cfg, const char* name, Form form, bool day) {
             note(std::string(name) + " pool=" + std::to_string(size) + " threads=" + std::to_string(t));
             pg::pool_options o;
             o.dsn = cfg.dsn;
-            o.pooler = cfg.pooler;
             o.max_conns = size;
             pg::pool p(o);
             std::atomic<std::uint64_t> rows_seen{0}, ops_seen{0};
@@ -464,9 +441,6 @@ void register_real(std::vector<Scenario>& v) {
     v.push_back({"real_list_join", run_list_join});
     v.push_back({"real_poll_serial", run_poll_serial});
     v.push_back({"real_poll_sent", run_poll_sent});
-    v.push_back({"real_me_auto", run_me_auto});
-    v.push_back({"real_list_auto", run_list_auto});
-    v.push_back({"real_poll_auto", run_poll_auto});
     v.push_back({"real_dash_day_rows", run_dash_day_rows});
     v.push_back({"real_dash_day_proj", run_dash_day_proj});
     v.push_back({"real_dash_day_agg", run_dash_day_agg});
@@ -475,9 +449,6 @@ void register_real(std::vector<Scenario>& v) {
     v.push_back({"real_dash_all_agg", run_dash_all_agg});
     v.push_back({"real_mix_serial", run_mix_serial});
     v.push_back({"real_mix_best", run_mix_best});
-    v.push_back({"real_mix_auto", run_mix_auto});
-    v.push_back({"real_point_off", run_point_off});
-    v.push_back({"real_point_auto", run_point_auto});
 }
 
 }  // namespace bench

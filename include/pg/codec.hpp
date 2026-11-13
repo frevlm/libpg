@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <bit>
 #include <chrono>
 #include <compare>
 #include <cstddef>
@@ -17,30 +18,13 @@ namespace pg {
 // A PostgreSQL type OID.
 using oid = unsigned int;
 
-// What the engine knows about a result column's type: its OID and the pg_type
-// row fields a codec may need to decide whether it accepts the column.
-struct type_desc {
-    oid id = 0;
-    std::string_view name;  // pg_type.typname
-    char category = 0;      // pg_type.typcategory ('S' string, 'N' numeric, ...)
-    char kind = 0;          // pg_type.typtype ('b' base, 'e' enum, 'd' domain, ...)
-    std::string_view column;  // the result column's name; empty for a type description
-};
-
-// Arbitrary precision numeric in PostgreSQL's own form: base-10000 digits,
-// the weight of the first digit and the display scale.
-struct numeric {
-    enum class special : std::uint8_t { none, nan, pos_inf, neg_inf };
-    special kind = special::none;
-    bool negative = false;
-    std::int16_t weight = 0;           // power of 10000 of digits[0]
-    std::uint16_t dscale = 0;          // decimal digits after the point
-    std::vector<std::int16_t> digits;  // each 0..9999, no leading or trailing zero groups
-
-    std::string to_string() const;                // "-12.3400", "NaN", "Infinity"
-    static numeric parse(std::string_view text);  // throws pg::error on bad text
-    bool operator==(const numeric&) const = default;
-};
+namespace detail {
+// Fixed point <-> text and binary numeric; used by decimal<S>.
+std::int64_t parse_scaled(std::string_view text, int scale);
+std::string format_scaled(std::int64_t units, int scale);
+void encode_scaled(std::int64_t units, int scale, std::string& out);
+std::int64_t decode_scaled(std::string_view bytes, int scale);
+}  // namespace detail
 
 // Fixed-point decimal with Scale digits after the point, held as an integer
 // count of 10^-Scale units. Maps NUMERIC(p, Scale) with p <= 18.
@@ -57,9 +41,9 @@ struct decimal {
     static constexpr decimal from_units(std::int64_t u) { return decimal{u}; }
     constexpr double to_double() const { return static_cast<double>(units) / static_cast<double>(one()); }
 
-    // Parses "-12.5"; more than Scale fractional digits or overflow throws pg::error.
-    static decimal parse(std::string_view text);
-    std::string to_string() const;  // always exactly Scale fractional digits
+    // Parses "-12.5"; a nonzero digit beyond Scale, or overflow, throws pg::error.
+    static decimal parse(std::string_view text) { return {detail::parse_scaled(text, Scale)}; }
+    std::string to_string() const { return detail::format_scaled(units, Scale); }  // exactly Scale decimals
 
     friend constexpr decimal operator+(decimal a, decimal b) { return {a.units + b.units}; }
     friend constexpr decimal operator-(decimal a, decimal b) { return {a.units - b.units}; }
@@ -69,7 +53,7 @@ struct decimal {
     friend constexpr auto operator<=>(decimal, decimal) = default;
 };
 
-// Text of a json or jsonb value.
+// The text of a jsonb value.
 struct jsonb {
     std::string text;
     bool operator==(const jsonb&) const = default;
@@ -77,213 +61,159 @@ struct jsonb {
 
 struct uuid {
     std::array<std::uint8_t, 16> bytes{};
-    std::string to_string() const;                // canonical 8-4-4-4-12 lower case
-    static uuid parse(std::string_view text);     // throws pg::error on bad text
+    std::string to_string() const;             // canonical 8-4-4-4-12, lower case
+    static uuid parse(std::string_view text);  // throws pg::error on bad text
     bool operator==(const uuid&) const = default;
 };
 
 using bytea = std::vector<std::byte>;
-
-// timestamptz as microseconds since the Unix epoch; ±infinity are max()/min().
+// Microseconds since the Unix epoch; ±infinity are max()/min().
 using timestamptz = std::chrono::sys_time<std::chrono::microseconds>;
-// date as days since the Unix epoch; ±infinity are max()/min().
+// Days since the Unix epoch; ±infinity are max()/min().
 using date = std::chrono::sys_days;
 
-// Conversion between a C++ type and PostgreSQL's wire format. Results are
-// always binary. A specialization provides:
-//
-//   static const oid param_oid;            // OID sent with a parameter; 0 lets the server infer it
-//   static constexpr bool param_binary;    // false: encode() writes text format
-//   static void encode(const T&, std::string& out);           // appends the parameter bytes
-//   static bool accepts(const type_desc&);                    // can decode this result column type
-//   static T decode(std::string_view bytes, const type_desc&); // binary result value, never NULL
-//
-// Parameter-only types (string_view, const char*) omit accepts/decode. Users
-// may specialize codec for their own types with the same members.
+// The binary wire form of a C++ type. A specialization provides:
+//   static constexpr oid type;                       // OID sent with a parameter
+//   static void encode(const T&, std::string& out);  // appends the binary bytes
+//   static bool accepts(oid column);                 // result column types it decodes
+//   static T decode(std::string_view bytes);         // a binary result value, never NULL
+// Parameter-only types (string views, C strings, vectors) omit accepts and decode.
 template <class T>
 struct codec;
 
-#define PG_DECLARE_CODEC(T, BINARY)                               \
-    template <>                                                   \
-    struct codec<T> {                                             \
-        static const oid param_oid;                               \
-        static constexpr bool param_binary = BINARY;              \
-        static void encode(const T& v, std::string& out);         \
-        static bool accepts(const type_desc& t);                  \
-        static T decode(std::string_view b, const type_desc& t);  \
-    };
-
-PG_DECLARE_CODEC(bool, true)
-PG_DECLARE_CODEC(std::int16_t, true)
-PG_DECLARE_CODEC(std::int32_t, true)
-PG_DECLARE_CODEC(std::int64_t, true)
-PG_DECLARE_CODEC(float, true)
-PG_DECLARE_CODEC(double, true)
-PG_DECLARE_CODEC(std::string, false)  // text parameter; accepts category 'S' types and enums
-PG_DECLARE_CODEC(numeric, true)
-PG_DECLARE_CODEC(jsonb, false)        // text parameter; accepts json and jsonb
-PG_DECLARE_CODEC(uuid, true)
-PG_DECLARE_CODEC(bytea, true)
-PG_DECLARE_CODEC(timestamptz, true)
-PG_DECLARE_CODEC(date, true)
-#undef PG_DECLARE_CODEC
-
 namespace detail {
-// Binary numeric <-> fixed point; used by codec<decimal<S>>.
-void encode_scaled(std::int64_t units, int scale, std::string& out);
-std::int64_t decode_scaled(std::string_view bytes, int scale);
-std::int64_t parse_scaled(std::string_view text, int scale);
-std::string format_scaled(std::int64_t units, int scale);
 
-// The array type of an element type; throws pg::error for a type it does not know.
-oid array_oid(oid element);
-// Appends a one-dimensional binary array of encoded elements; a null element is SQL NULL.
-void encode_array(oid element, const std::vector<const std::optional<std::string>*>& elems, std::string& out);
-}  // namespace detail
+void put_be(std::uint64_t v, std::size_t bytes, std::string& out);
+// The big-endian integer of exactly `bytes` bytes; another length throws pg::error.
+std::uint64_t get_be(std::string_view b, std::size_t bytes);
 
-template <int S>
-decimal<S> decimal<S>::parse(std::string_view text) {
-    return {detail::parse_scaled(text, S)};
-}
-template <int S>
-std::string decimal<S>::to_string() const {
-    return detail::format_scaled(units, S);
+template <oid Type>
+struct exact {
+    static constexpr oid type = Type;
+    static constexpr bool accepts(oid column) { return column == Type; }
+};
+
+// Integers and floats: their bits, big-endian.
+template <class T, oid Type>
+struct bits_codec : exact<Type> {
+    using U = std::conditional_t<sizeof(T) == 2, std::uint16_t,
+                                 std::conditional_t<sizeof(T) == 4, std::uint32_t, std::uint64_t>>;
+    static void encode(T v, std::string& out) { put_be(std::bit_cast<U>(v), sizeof(T), out); }
+    static T decode(std::string_view b) { return std::bit_cast<T>(static_cast<U>(get_be(b, sizeof(T)))); }
+};
+
+template <class T> inline constexpr bool is_optional = false;
+template <class T> inline constexpr bool is_optional<std::optional<T>> = true;
+template <class T> struct value_of { using type = T; };
+template <class T> struct value_of<std::optional<T>> { using type = T; };
+// T without cv, reference and one std::optional layer.
+template <class T>
+using value_t = typename value_of<std::remove_cvref_t<T>>::type;
+// The codec a value of type T (optional or not) goes through.
+template <class T>
+using codec_of = codec<std::decay_t<value_t<T>>>;
+
+// The array type of an element type; 0 for one without.
+constexpr oid array_of(oid element) {
+    constexpr oid pairs[][2] = {{16, 1000}, {17, 1001},  {20, 1016},   {21, 1005},   {23, 1007},   {25, 1009}, {700, 1021},
+                                {701, 1022}, {1082, 1182}, {1184, 1185}, {1700, 1231}, {2950, 2951}, {3802, 3807}};
+    for (const auto& p : pairs)
+        if (p[0] == element) return p[1];
+    return 0;
 }
 
-template <int S>
-struct codec<decimal<S>> {
-    static constexpr oid param_oid = 1700;
-    static constexpr bool param_binary = true;
-    static void encode(const decimal<S>& v, std::string& out) { detail::encode_scaled(v.units, S, out); }
-    static bool accepts(const type_desc& t) { return t.id == 1700; }
-    // A value with more than S nonzero fractional digits, or out of range, throws pg::error.
-    static decimal<S> decode(std::string_view b, const type_desc&) { return {detail::decode_scaled(b, S)}; }
-};
+// A one-dimensional binary array, element by element; an empty optional is NULL.
+struct array_builder {
+    oid element = 0;
+    std::string body;
+    std::uint32_t count = 0;
+    bool nulls = false;
 
-// The other 64-bit signed integer type (long on one platform, long long on the
-// other) shares the int8 codec.
-template <class T>
-    requires(std::is_integral_v<T> && std::is_signed_v<T> && sizeof(T) == 8 && !std::is_same_v<T, std::int64_t>)
-struct codec<T> {
-    static constexpr oid param_oid = 20;
-    static constexpr bool param_binary = true;
-    static void encode(const T& v, std::string& out) {
-        codec<std::int64_t>::encode(static_cast<std::int64_t>(v), out);
-    }
-    static bool accepts(const type_desc& t) { return codec<std::int64_t>::accepts(t); }
-    static T decode(std::string_view b, const type_desc& t) {
-        return static_cast<T>(codec<std::int64_t>::decode(b, t));
-    }
-};
-
-namespace detail {
-template <class T, class = void>
-struct has_binary_codec : std::false_type {};
-template <class T>
-struct has_binary_codec<T, std::void_t<decltype(codec<T>::param_binary)>> : std::bool_constant<codec<T>::param_binary> {
-};
-}  // namespace detail
-
-// A parameter-only codec for a one-dimensional array of a binary element type.
-template <class T>
-    requires detail::has_binary_codec<T>::value
-struct codec<std::vector<T>> {
-    static inline const oid param_oid = detail::array_oid(codec<T>::param_oid);
-    static constexpr bool param_binary = true;
-    static void encode(const std::vector<T>& v, std::string& out) {
-        std::vector<std::optional<std::string>> elems;
-        elems.reserve(v.size());
-        for (const auto& x : v) {
-            std::string b;
-            codec<T>::encode(static_cast<T>(x), b);
-            elems.emplace_back(std::move(b));
+    template <class T>
+    void add(const T& v) {
+        element = codec_of<T>::type;
+        ++count;
+        if constexpr (is_optional<T>) {
+            if (!v) {
+                nulls = true;
+                return put_be(0xffffffff, 4, body);
+            }
         }
-        std::vector<const std::optional<std::string>*> refs;
-        refs.reserve(elems.size());
-        for (const auto& e : elems) refs.push_back(&e);
-        detail::encode_array(codec<T>::param_oid, refs, out);
+        const std::size_t at = body.size();
+        body.append(4, '\0');
+        if constexpr (is_optional<T>) codec_of<T>::encode(*v, body);
+        else codec_of<T>::encode(v, body);
+        const auto n = static_cast<std::uint32_t>(body.size() - at - 4);
+        for (int i = 0; i < 4; ++i) body[at + i] = static_cast<char>(n >> (24 - 8 * i));
     }
+    std::string finish() const;  // the header, then the elements
 };
 
-// Parameter-only string types: text format, type inferred by the server.
+}  // namespace detail
+
+#define PG_CODEC(T, OID)                                       \
+    template <>                                                \
+    struct codec<T> : detail::exact<OID> {                     \
+        static void encode(const T& v, std::string& out);      \
+        static T decode(std::string_view b);                   \
+    };
+PG_CODEC(bool, 16)
+PG_CODEC(bytea, 17)
+PG_CODEC(date, 1082)
+PG_CODEC(timestamptz, 1184)
+PG_CODEC(uuid, 2950)
+PG_CODEC(jsonb, 3802)  // binary jsonb: version byte 1, then the text
+#undef PG_CODEC
+
+template <>
+struct codec<std::int16_t> : detail::bits_codec<std::int16_t, 21> {};
+template <>
+struct codec<std::int32_t> : detail::bits_codec<std::int32_t, 23> {};
+// int64_t and the other 64-bit signed type (long on one platform, long long on the other).
+template <class T>
+    requires(std::is_integral_v<T> && std::is_signed_v<T> && sizeof(T) == 8)
+struct codec<T> : detail::bits_codec<T, 20> {};
+template <>
+struct codec<float> : detail::bits_codec<float, 700> {};
+template <>
+struct codec<double> : detail::bits_codec<double, 701> {};
+
+// text; reads text, varchar, bpchar and name columns. Binary text is the raw bytes.
+template <>
+struct codec<std::string> {
+    static constexpr oid type = 25;
+    static constexpr bool accepts(oid c) { return c == 25 || c == 1043 || c == 1042 || c == 19; }
+    static void encode(std::string_view v, std::string& out) { out.append(v); }
+    static std::string decode(std::string_view b) { return std::string(b); }
+};
 template <>
 struct codec<std::string_view> {
-    static constexpr oid param_oid = 0;
-    static constexpr bool param_binary = false;
+    static constexpr oid type = 25;
     static void encode(std::string_view v, std::string& out) { out.append(v); }
 };
 template <>
 struct codec<const char*> : codec<std::string_view> {};
 template <>
 struct codec<char*> : codec<std::string_view> {};
-template <std::size_t N>
-struct codec<char[N]> : codec<std::string_view> {};
 
-namespace detail {
-
-template <class T>
-inline constexpr bool is_optional = false;
-template <class T>
-inline constexpr bool is_optional<std::optional<T>> = true;
-
-template <class T>
-struct value_of {
-    using type = T;
-};
-template <class T>
-struct value_of<std::optional<T>> {
-    using type = T;
-};
-// T with one std::optional layer removed.
-template <class T>
-using value_t = typename value_of<std::remove_cvref_t<T>>::type;
-
-// One bound parameter: its type OID (0 = inferred), format, and bytes; no
-// bytes means SQL NULL.
-struct param {
-    oid type = 0;
-    bool binary = false;
-    std::optional<std::string> bytes;
-    bool operator==(const param&) const = default;
+// NUMERIC; decoding a value with a nonzero digit beyond S, or out of range, throws pg::error.
+template <int S>
+struct codec<decimal<S>> : detail::exact<1700> {
+    static void encode(const decimal<S>& v, std::string& out) { detail::encode_scaled(v.units, S, out); }
+    static decimal<S> decode(std::string_view b) { return {detail::decode_scaled(b, S)}; }
 };
 
-// A parameter holding a one-dimensional binary array of those elements.
-param array_param(oid element, const std::vector<const std::optional<std::string>*>& elems);
-
+// A one-dimensional array parameter of a type that has a codec.
 template <class T>
-param to_param(const T& v) {
-    using V = std::decay_t<value_t<T>>;
-    using C = codec<V>;
-    param p{C::param_oid, C::param_binary, std::nullopt};
-    if constexpr (is_optional<std::remove_cvref_t<T>>) {
-        if (!v) return p;
-        C::encode(*v, p.bytes.emplace());
-    } else {
-        C::encode(v, p.bytes.emplace());
+    requires requires { detail::codec_of<T>::type; }
+struct codec<std::vector<T>> {
+    static constexpr oid type = detail::array_of(detail::codec_of<T>::type);
+    static_assert(type != 0, "no array type for this element type");
+    static void encode(const std::vector<T>& v, std::string& out) {
+        detail::array_builder b{detail::codec_of<T>::type};
+        for (const T& x : v) b.add(x);
+        out += b.finish();
     }
-    return p;
-}
+};
 
-// Whether a result column of type `t` can be read as T (optional unwrapped).
-template <class T>
-bool accepts(const type_desc& t) {
-    return codec<value_t<T>>::accepts(t);
-}
-
-// Decodes one binary result value; `v` is nullptr for SQL NULL, which only an
-// optional T may hold.
-template <class T>
-T decode_value(const char* v, std::size_t n, const type_desc& t) {
-    if (!v) {
-        if constexpr (is_optional<T>) return std::nullopt;
-        else throw error(error_kind::other, "NULL in a column read as a non-optional type");
-    }
-    return codec<value_t<T>>::decode(std::string_view(v, n), t);
-}
-
-// The name, category and kind of a built-in type, or nullptr when `id` is not
-// one libpg knows without asking the server.
-const type_desc* builtin_type(oid id);
-
-}  // namespace detail
 }  // namespace pg

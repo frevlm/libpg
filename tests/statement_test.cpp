@@ -15,18 +15,21 @@ std::vector<std::optional<std::string>> bytes_of(const pg::rendered& r) {
     return out;
 }
 
+// The type OID of each parameter.
+std::vector<pg::oid> types_of(const pg::rendered& r) {
+    std::vector<pg::oid> out;
+    for (const auto& p : r.params) out.push_back(p.type);
+    return out;
+}
+
 }  // namespace
 
-TEST_CASE("placeholders render as numbered parameters") {
+TEST_CASE("placeholders render as numbered binary parameters with their type") {
     const pg::sql q{"SELECT id FROM users WHERE name = {} AND age > {}", std::string("ann"), std::int32_t{30}};
     const pg::rendered r = q.render();
     REQUIRE(r.text == "SELECT id FROM users WHERE name = $1 AND age > $2");
-    REQUIRE(r.params.size() == 2);
-    REQUIRE(r.params[0].type == 0);
-    REQUIRE_FALSE(r.params[0].binary);
-    REQUIRE(r.params[0].bytes == "ann");
-    REQUIRE(r.params[1].type == 23);
-    REQUIRE(r.params[1].binary);
+    REQUIRE(types_of(r) == std::vector<pg::oid>{25, 23});
+    REQUIRE(bytes_of(r) == std::vector<std::optional<std::string>>{std::string("ann"), std::string("\0\0\0\x1e", 4)});
 }
 
 TEST_CASE("a statement without arguments is its text") {
@@ -52,7 +55,7 @@ TEST_CASE("concatenation renumbers parameters") {
     q = q + pg::sql{" AND c = {} ORDER BY id", std::int64_t{3}};
     const pg::rendered r = q.render();
     REQUIRE(r.text == "SELECT * FROM t WHERE a = $1 AND b = $2 AND c = $3 ORDER BY id");
-    REQUIRE(r.params.size() == 3);
+    REQUIRE(types_of(r) == std::vector<pg::oid>{23, 25, 20});
     REQUIRE(r.params[1].bytes == "two");
 }
 
@@ -61,7 +64,7 @@ TEST_CASE("a statement argument is spliced and renumbered") {
     const pg::sql q{"SELECT {} FROM t WHERE {} LIMIT {}", std::int32_t{0}, where, std::int32_t{10}};
     const pg::rendered r = q.render();
     REQUIRE(r.text == "SELECT $1 FROM t WHERE name = $2 AND age > $3 LIMIT $4");
-    REQUIRE(r.params.size() == 4);
+    REQUIRE(types_of(r) == std::vector<pg::oid>{23, 25, 23, 23});
     REQUIRE(r.params[1].bytes == "x");
 }
 
@@ -73,11 +76,11 @@ TEST_CASE("join puts the separator between parts") {
     REQUIRE(pg::join({}, pg::sql{", "}).render().text.empty());
 }
 
-TEST_CASE("optional arguments bind NULL when empty") {
+TEST_CASE("optional arguments bind NULL of their type when empty") {
     const pg::sql q{"VALUES ({}, {})", std::optional<std::int32_t>{}, std::optional<std::string>{"v"}};
     const pg::rendered r = q.render();
     REQUIRE(bytes_of(r) == std::vector<std::optional<std::string>>{std::nullopt, std::string("v")});
-    REQUIRE(r.params[0].type == 23);
+    REQUIRE(types_of(r) == std::vector<pg::oid>{23, 25});
 }
 
 TEST_CASE("string literals, views and C strings are text parameters") {
@@ -85,7 +88,14 @@ TEST_CASE("string literals, views and C strings are text parameters") {
     const pg::sql q{"VALUES ({}, {}, {})", "lit", std::string_view("view"), c};
     const pg::rendered r = q.render();
     REQUIRE(bytes_of(r) == std::vector<std::optional<std::string>>{std::string("lit"), std::string("view"), std::string("c")});
-    for (const auto& p : r.params) REQUIRE(p.type == 0);
+    REQUIRE(types_of(r) == std::vector<pg::oid>{25, 25, 25});
+}
+
+TEST_CASE("a vector argument is one array parameter") {
+    const pg::sql q{"SELECT unnest({})", std::vector<std::int64_t>{1, 2}};
+    const pg::rendered r = q.render();
+    REQUIRE(r.text == "SELECT unnest($1)");
+    REQUIRE(types_of(r) == std::vector<pg::oid>{1016});
 }
 
 TEST_CASE("unsafe_sql takes runtime text verbatim") {
@@ -98,21 +108,6 @@ TEST_CASE("identifiers are quoted") {
     REQUIRE(pg::ident("we\"ird").render().text == "\"we\"\"ird\"");
 }
 
-static_assert(!pg::detail::pins_text("SELECT 1"));
-static_assert(pg::detail::pins_text("LISTEN x"));
-
-TEST_CASE("the pin verdict is decided at compile time and matches the rendered text") {
-    const auto check = [](const pg::sql& q, bool want) {
-        const std::string text = q.render().text;
-        REQUIRE(pg::detail::pins_of(q, text) == pg::detail::pins_text(text));
-        REQUIRE(pg::detail::pins_of(q, text) == want);
-    };
-    check(pg::sql{"SELECT id FROM t WHERE id = {}", 1}, false);
-    check(pg::sql{"select pg_advisory_lock({})", 1}, true);
-    check(pg::sql{"  -- c\n SELECT currval('s')"}, true);
-    check(pg::sql{"SET search_path = public"}, true);
-    check(pg::sql{"INSERT INTO t VALUES ({})", 2}, false);
-    check(pg::sql{"{} UNION SELECT 1", pg::sql{"SELECT 2"}}, false);
-    check(pg::sql{"{}", pg::sql{"SELECT set_config('a','b',false)"}}, true);
-}
-
+static_assert(pg::detail::count_placeholders("a {} b {{ }} {}") == 2);
+static_assert(pg::detail::count_placeholders("a { b") == -1);
+static_assert(pg::detail::count_placeholders("a } b") == -1);

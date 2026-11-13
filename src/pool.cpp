@@ -1,1000 +1,609 @@
-#include "pg/pool.hpp"
+#include <poll.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <condition_variable>
-#include <cstdio>
 #include <cstdlib>
 #include <deque>
-#include <exception>
-#include <initializer_list>
-#include <memory>
-#include <mutex>
 #include <random>
 #include <thread>
 #include <unordered_map>
-#include <utility>
 
-#include "engine.hpp"
-#include "prefetch.hpp"
+#include "pg/pool.hpp"
+
+#if !defined(LIBPQ_HAS_PIPELINING)
+#error "libpg needs libpq 14 or newer (pipeline mode)"
+#endif
 
 namespace pg {
 namespace detail {
 
-using clock = std::chrono::steady_clock;
+// A server-side prepared statement and its result columns.
+struct prepared {
+    std::string name;
+    std::vector<oid> types;
+    std::vector<std::string> names;
+    check_fn checked = nullptr;  // the last check that passed
+};
 
-// A borrower waiting in line. It is handed a session, or (s == nullptr) a
-// slot to open a new connection in, or it is timed out at its deadline. The
-// pool sets `s` and `state` under its lock; the borrower watches `state`
-// without the lock.
+// One connection, nonblocking and in pipeline mode, with the statements prepared
+// on it. Several threads may queue tickets on it at once; `mu` guards the
+// connection and everything from `reading` to `formats`, the pool mutex guards
+// `users` and `reserved`.
+struct wire {
+    explicit wire(PGconn* conn) : c(conn) {}
+    ~wire() { PQfinish(c); }
+
+    PGconn* c;
+    std::mutex mu;
+    std::condition_variable cv;  // a ticket was filled or the reader left poll()
+    bool reading = false;        // a thread waits in poll() on the socket
+    int nulls = 0;               // NULL results in a row
+    std::uint64_t names = 0;     // prepared statements are s1, s2, ...
+    std::uint64_t clears = 0;    // times the cache was cleared
+    std::unordered_map<std::string, prepared> cache;  // by ticket key
+    std::deque<std::shared_ptr<ticket>> queue;  // round trips sent and not yet read
+    std::vector<const char*> values;            // bind buffers, reused
+    std::vector<int> lengths, formats;
+    std::atomic<bool> broken{false};  // lost or out of step: never used again
+    bool raw = false;                 // handed out by conn::raw()
+    bool shared = false;              // the queued tickets are of conns sharing it, one statement each
+    int users = 0;                    // threads sharing it for a statement each; -1 while one conn holds it
+    bool reserved = false;            // shared by nobody new: it goes to a waiter once its users are done
+};
+
+// A borrower waiting for a wire.
 struct waiter {
-    using state_t = std::atomic_signed_lock_free::value_type;
-    enum : state_t { asleep, served, timed_out };
-    std::atomic_signed_lock_free state{asleep};
-    clock::time_point deadline;
-    session* s = nullptr;
-};
-
-// A waiter to notify after the pool lock is released, so the woken borrower
-// does not run into the lock still held. Declared before the lock it follows.
-struct wakeups {
-    std::shared_ptr<waiter> w;
-    void add(std::shared_ptr<waiter> x) { w = std::move(x); }
-    ~wakeups() {
-        if (w) w->state.notify_one();
-    }
-};
-
-// `open` counts sessions alive or being opened; `leased` those lent out or
-// being opened for a borrower. Waiters are served in arrival order, directly
-// by whoever frees a session or a slot, so `idle` is only non-empty while
-// nobody waits.
-//
-// Waiters block without a timeout; the keeper thread, started by the first
-// waiter, times them out.
-struct pool_state {
-    mutable std::mutex mu;
-    std::condition_variable keeper_cv;
-    std::thread keeper;
-    bool stopping = false;
-    int open = 0;
-    int leased = 0;
-    std::vector<session*> idle;
-    // Read-only sessions of speculation: kept apart from the borrowable ones,
-    // never leased, outside max_conns. `ro_open` counts them alive or being
-    // opened.
-    std::vector<session*> ro;
-    int ro_open = 0;
-    std::deque<std::shared_ptr<waiter>> waiters;
-    std::atomic<std::uint64_t> borrows{0};
-    std::uint64_t connect_failures = 0;
-    int failures = 0;  // consecutive connect failures
-    bool breaker_open = false;
-    std::chrono::milliseconds cooldown{0};
-    clock::time_point retry_at;
-    // The base types of COPY columns by table and column list.
-    std::unordered_map<std::string, std::vector<copy_target>> copy_types;
-    prefetch_table prefetch;
-};
-
-prefetch_table& prefetch_of(pool_state& st) { return st.prefetch; }
-
-// A statement in flight on a session it owns a reference to.
-struct flight {
-    session* s = nullptr;
-    pending_ptr pd;
-};
-
-// A statement sent by conn::send and its outcome once read.
-struct sent {
-    sql q;                        // owns the parameters r views
-    rendered r;                   // r = q.render() after q is set; sent is never moved
-    statement stmt;               // views r
-    pool_state* st = nullptr;
-    const pool_options* opts = nullptr;  // to re-run a stale floating statement
-    bool held = false;            // on the conn's own (leased) session
-    flight f;                     // where it travels
-    std::optional<outcome> out;   // set by finish()
-    bool taken = false;           // a reader consumed the result
+    bool exclusive;
+    wire* got = nullptr;
+    std::condition_variable cv;
 };
 
 namespace {
 
-// The pools this thread holds a connection of.
-thread_local std::vector<const pool*> held_pools;
+// Runs f when the scope ends.
+template <class F>
+struct on_exit {
+    F f;
+    ~on_exit() { f(); }
+};
 
-constexpr std::chrono::milliseconds max_cooldown{30'000};
+// The statement text of a ticket key: what precedes its NUL.
+std::string text_of(const std::string& key) { return key.c_str(); }
 
-// Serves the head of the line.
-void hand_off(pool_state& st, session* s, wakeups& wk) {
-    std::shared_ptr<waiter> w = std::move(st.waiters.front());
-    st.waiters.pop_front();
-    w->s = s;
-    ++st.leased;
-    w->state.store(waiter::served, std::memory_order_release);
-    wk.add(std::move(w));
+// The statement text, then NUL and the parameter type OIDs.
+std::string key_of(std::string text, std::span<const param> params) {
+    if (text.find('\0') != std::string::npos) throw error(error_kind::other, "statement text holds a NUL byte");
+    text.push_back('\0');
+    for (const auto& p : params) put_be(p.type, 4, text);
+    return text;
 }
 
-// A connection slot became free: the oldest waiter gets it, if any.
-void free_slot(pool_state& st, wakeups& wk) {
-    if (st.waiters.empty()) --st.open;
-    else hand_off(st, nullptr, wk);
+std::string trimmed(std::string m) {
+    while (!m.empty() && (m.back() == '\n' || m.back() == ' ')) m.pop_back();
+    return m;
 }
 
-// Waits until the waiter is served or timed out.
-waiter::state_t await(waiter& w) {
-    for (;;) {
-        const waiter::state_t v = w.state.load(std::memory_order_acquire);
-        if (v != waiter::asleep) return v;
-        w.state.wait(waiter::asleep, std::memory_order_acquire);
+std::string message(PGconn* c) { return trimmed(PQerrorMessage(c)); }
+
+int command(PGconn* c, const std::string& text) {
+    return PQsendQueryParams(c, text.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 1);
+}
+
+error server_error(const PGresult* r, const std::string& key) {
+    const char* state = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+    const char* primary = PQresultErrorField(r, PG_DIAG_MESSAGE_PRIMARY);
+    const std::string s = state ? state : "", m = primary ? primary : trimmed(PQresultErrorMessage(r));
+    return error(classify(s, m), m, s, text_of(key));
+}
+
+// The wire cannot be used any more: every ticket on it is done, failing with
+// `why` unless it holds its own error.
+bool lose(wire& w, error_kind kind, const std::string& why) {
+    w.broken = true;
+    for (const auto& t : w.queue) {
+        if (!t->err) t->err.emplace(kind, why, std::string(), text_of(t->key));
+        t->done = true;
     }
+    w.queue.clear();
+    w.cv.notify_all();
+    return false;
 }
 
-// Times out the waiters whose deadline passed.
-void expire_waiters(pool_state& st, clock::time_point now) {
-    std::erase_if(st.waiters, [&](const std::shared_ptr<waiter>& w) {
-        if (w->deadline > now) return false;
-        w->state.store(waiter::timed_out, std::memory_order_release);
-        w->state.notify_one();
-        return true;
-    });
-}
-
-// The earliest deadline in line. A waiter arriving later has a deadline of at
-// least now + acquire_timeout, so with nobody in line that is the next wake.
-clock::time_point next_deadline(const pool_state& st, clock::time_point now, std::chrono::milliseconds timeout) {
-    clock::time_point next = now + timeout;
-    for (const auto& w : st.waiters) next = std::min(next, w->deadline);
-    return next;
-}
-
-void keep_time(pool_state& st, std::chrono::milliseconds timeout) {
-    std::unique_lock lk(st.mu);
-    while (!st.stopping) {
-        const auto now = clock::now();
-        expire_waiters(st, now);
-        st.keeper_cv.wait_until(lk, next_deadline(st, now, timeout));
-    }
-}
-
-session* wait_in_line(pool_state& st, const pool_options& o, std::unique_lock<std::mutex>& lk) {
-    if (!st.keeper.joinable()) st.keeper = std::thread(keep_time, std::ref(st), o.acquire_timeout);
-    auto w = std::make_shared<waiter>();
-    w->deadline = clock::now() + o.acquire_timeout;
-    st.waiters.push_back(w);
-    lk.unlock();
-    if (await(*w) == waiter::timed_out) throw error(error_kind::connect_failed, "timed out waiting for a free connection");
-    return w->s;
-}
-
-// The session of `v` (the idle or the read-only ones) to take and whether every
-// one is slow. A session whose front round trip has been the front for more
-// than twice the best round-trip time, or whose known-slow statement is due to
-// stay busy past twice the best round-trip time, is likely running a slow
-// statement: nothing piles onto it.
-std::pair<std::vector<session*>::iterator, bool> pick_idle(std::vector<session*>& v, std::int64_t now) {
-    std::int64_t best = 0;
-    for (session* s : v) {
-        const std::int64_t rtt = s->busy.rtt_ns.load(std::memory_order_relaxed);
-        if (rtt > 0 && (best == 0 || rtt < best)) best = rtt;
-    }
-    // Twice the best round trip, at least 1 ms: below that, scheduling noise
-    // on a busy client looks like a slow statement.
-    const std::int64_t limit = std::max<std::int64_t>(2 * best, 1'000'000);
-    const auto slow = [&](const session* s) { return s->busy.slow(now, best, limit); };
-    auto pick = v.end();
-    for (auto it = v.begin(); it != v.end(); ++it)
-        if (!slow(*it) && (pick == v.end() ||
-                           (*it)->refs.load(std::memory_order_relaxed) <
-                               (*pick)->refs.load(std::memory_order_relaxed)))
-            pick = it;
-    if (pick != v.end()) return {pick, false};
-    // Every session is slow: the youngest head.
-    for (auto it = v.begin(); it != v.end(); ++it)
-        if (pick == v.end() || (*it)->busy.head_since.load(std::memory_order_relaxed) >
-                                         (*pick)->busy.head_since.load(std::memory_order_relaxed))
-            pick = it;
-    return {pick, true};
-}
-
-// An idle session a floating statement may share: it stays in idle and takes no
-// lease. Nullptr asks the caller to take a lease instead, spreading load.
-session* attach(pool_state& st, const pool_options& o) {
-    std::lock_guard lk(st.mu);
-    if (st.idle.empty()) return nullptr;
-    const auto [it, stalled] = pick_idle(st.idle, now_ns());
-    const bool full = st.open >= o.max_conns;
-    if ((stalled || (*it)->refs.load(std::memory_order_relaxed) > 1) && !full) return nullptr;
-    // Counted as an owner before the pool lock is released, so that nobody
-    // deletes it under us; settle() undoes this.
-    ref(**it);
-    return *it;
-}
-
-// An idle session, or nullptr for a slot to open one in; waits in line when
-// neither is free or others wait already. The session with the fewest owners is
-// taken, so traffic spreads before piling onto one connection; a new
-// connection is opened instead while the pool has room. A session likely busy
-// with a slow statement is skipped unless every idle one is.
-session* reserve(pool_state& st, const pool_options& o) {
-    std::unique_lock lk(st.mu);
-    if (!st.waiters.empty()) return wait_in_line(st, o, lk);
-    if (st.idle.empty()) {
-        if (st.open >= o.max_conns) return wait_in_line(st, o, lk);
-        ++st.open;
-        ++st.leased;
-        return nullptr;
-    }
-    const auto [it, stalled_only] = pick_idle(st.idle, now_ns());
-    const int refs = (*it)->refs.load(std::memory_order_relaxed);
-    // Every idle session is stalled, but a leased or opening one may come
-    // back: wait for it rather than piling onto a slow statement.
-    if (stalled_only && st.open >= o.max_conns && st.idle.size() < static_cast<std::size_t>(st.open))
-        return wait_in_line(st, o, lk);
-    if (st.open < o.max_conns && (stalled_only || refs > 1)) {
-        ++st.open;
-        ++st.leased;
-        return nullptr;
-    }
-    session* s = *it;
-    st.idle.erase(it);
-    ++st.leased;
-    return s;
-}
-
-enum class gate { refused, normal, trial };
-
-// Whether a new connection may be tried now. While the breaker is open, one
-// try (the trial) is allowed per cooldown.
-gate may_connect(pool_state& st) {
-    if (!st.breaker_open) return gate::normal;
-    const auto now = clock::now();
-    if (now < st.retry_at) return gate::refused;
-    st.retry_at = now + st.cooldown;
-    return gate::trial;
-}
-
-// The breaker opens after enough consecutive failures; the cooldown doubles
-// only when the trial connect fails, not for connects begun before it opened.
-void note_connect_failure(pool_state& st, const pool_options& o, gate g) {
-    ++st.connect_failures;
-    ++st.failures;
-    if (g == gate::trial) {
-        st.cooldown = std::min(st.cooldown * 2, max_cooldown);
-    } else if (st.breaker_open || st.failures < o.breaker_failures) {
-        return;
-    } else {
-        st.cooldown = o.breaker_cooldown;
-        st.breaker_open = true;
-    }
-    st.retry_at = clock::now() + st.cooldown;
-}
-
-void note_connect_success(pool_state& st) {
-    st.failures = 0;
-    st.breaker_open = false;
-}
-
-session* open_in_slot(pool_state& st, const pool_options& o, clock::time_point until) {
-    gate g = gate::normal;
-    {
-        wakeups wk;
-        std::lock_guard lk(st.mu);
-        g = may_connect(st);
-        if (g == gate::refused) {
-            --st.leased;
-            free_slot(st, wk);
-            throw error(error_kind::connect_failed, "connection breaker is open after repeated connect failures");
+// Reads what has arrived without blocking and fills tickets in queue order, each
+// up to its Sync; then pushes pending output. Returns whether output is left. A
+// FATAL or PANIC error ends the session; a shared statement that opens a
+// transaction would put the others' statements into it, so both lose the wire.
+bool pump(wire& w) {
+    if (!PQconsumeInput(w.c)) return lose(w, error_kind::broken, message(w.c));
+    while (!w.queue.empty() && !PQisBusy(w.c)) {
+        ticket& t = *w.queue.front();
+        PGresult* r = PQgetResult(w.c);
+        if (!r) {  // between two commands; twice in a row means nothing more is coming
+            if (PQstatus(w.c) != CONNECTION_OK || ++w.nulls > 1) return lose(w, error_kind::broken, message(w.c));
+            continue;
         }
+        w.nulls = 0;
+        const ExecStatusType st = PQresultStatus(r);
+        if (st == PGRES_TUPLES_OK || st == PGRES_COMMAND_OK || st == PGRES_EMPTY_QUERY) {
+            t.res.reset(r);
+            continue;
+        }
+        const char* sev = PQresultErrorField(r, PG_DIAG_SEVERITY_NONLOCALIZED);
+        const std::string fatal = sev && std::string_view(sev) != "ERROR" ? trimmed(PQresultErrorMessage(r)) : "";
+        if (st == PGRES_FATAL_ERROR && !t.err && fatal.empty()) t.err = server_error(r, t.key);
+        PQclear(r);
+        if (!fatal.empty() || PQstatus(w.c) != CONNECTION_OK)
+            return lose(w, error_kind::broken, fatal.empty() ? message(w.c) : fatal);
+        if (st != PGRES_PIPELINE_SYNC && st != PGRES_FATAL_ERROR && st != PGRES_PIPELINE_ABORTED)
+            return lose(w, error_kind::other, std::string("unexpected result status ") + PQresStatus(st));
+        if (st != PGRES_PIPELINE_SYNC) continue;
+        const std::string_view tag = t.res ? PQcmdStatus(t.res.get()) : "";
+        if (w.shared && (tag == "BEGIN" || tag == "START TRANSACTION")) {
+            t.err.emplace(error_kind::other, "a statement opened a transaction outside pg::transaction", std::string(),
+                          text_of(t.key));
+            return lose(w, error_kind::broken, "the connection was closed: a statement sharing it opened a transaction");
+        }
+        t.done = true;
+        if (t.err && t.err->kind == error_kind::stale_statement) w.cache.erase(t.key);
+        w.queue.pop_front();
     }
-    try {
-        session* s = open_session(o, until);
-        std::lock_guard lk(st.mu);
-        note_connect_success(st);
-        return s;
-    } catch (const error&) {
-        wakeups wk;
-        std::lock_guard lk(st.mu);
-        note_connect_failure(st, o, g);
-        --st.leased;
-        free_slot(st, wk);
-        throw;
+    const int left = PQflush(w.c);
+    return left < 0 ? lose(w, error_kind::broken, message(w.c)) : left > 0;
+}
+
+// Waits until t is filled. One thread at a time polls the socket and fills
+// whichever tickets arrive; the others wait for it to fill theirs or to leave.
+void drive(wire& w, ticket& t) {
+    std::unique_lock lk(w.mu);
+    w.cv.wait(lk, [&] { return t.done || !w.reading; });
+    if (t.done) return;
+    for (;;) {  // the poller pumps and notifies every time it leaves poll()
+        const bool out = pump(w);
+        w.cv.notify_all();
+        if (t.done) return;
+        pollfd fd{PQsocket(w.c), static_cast<short>(POLLIN | (out ? POLLOUT : 0)), 0};
+        w.reading = true;
+        lk.unlock();
+        poll(&fd, 1, -1);
+        lk.lock();
+        w.reading = false;
     }
 }
 
-// A session for a borrower: an idle one (probed when it sat unused too long;
-// one that fails the probe is replaced in its slot) or a new one.
-session* lend(pool_state& st, const pool_options& o) {
-    const auto now = clock::now();
-    const auto until = now + o.acquire_timeout;
-    session* s = reserve(st, o);
-    if (s && (now - s->last_used <= o.probe_after || ping(*s))) {
-        set_exclusive(*s, true);
-        return s;
-    }
-    if (s) unref(s);
-    s = open_in_slot(st, o, until);
-    set_exclusive(*s, true);
-    return s;
-}
-
-// A conn floats from the start when an idle connection is there; otherwise it
-// leases one exactly as lend() does.
-session* lend_unless_idle(pool_state& st, const pool_options& o) {
-    {
-        std::lock_guard lk(st.mu);
-        if (!st.idle.empty()) return nullptr;
-    }
-    return lend(st, o);
-}
-
-// A BEGIN still pending was never sent: dropping it leaves the connection idle.
-// A lease that changed session settings leaves a RESET ALL in front of the next one.
-void release(pool_state& st, session* s) {
-    {
-        std::lock_guard lk(s->mu);
-        s->exclusive = false;
-        s->last_used = clock::now();
-        s->begin_pending = false;
-        s->depth = 0;
-        if (std::exchange(s->dirty, false)) s->reset_pending = true;
-    }
-    const bool keep = pg::detail::reusable(*s);
-    wakeups wk;
-    std::unique_lock lk(st.mu);
-    --st.leased;
-    if (keep) {
-        if (st.waiters.empty()) st.idle.push_back(s);
-        else hand_off(st, s, wk);
-        return;
-    }
-    free_slot(st, wk);
+// Reads every ticket queued on a held wire; returns the first error among them.
+std::optional<error> drain(wire& w) {
+    std::unique_lock lk(w.mu);
+    const auto unread = w.queue;
     lk.unlock();
-    unref(s);
+    if (!unread.empty()) drive(w, *unread.back());
+    for (const auto& t : unread)
+        if (t->err) return t->err;
+    return std::nullopt;
 }
 
-void check_options(const pool_options& o) {
-    if (o.max_conns < 1) throw error(error_kind::other, "pool: max_conns must be at least 1");
-    if (o.acquire_timeout <= std::chrono::milliseconds::zero())
-        throw error(error_kind::other, "pool: acquire_timeout must be positive");
-    if (o.breaker_failures < 1) throw error(error_kind::other, "pool: breaker_failures must be at least 1");
-    if (o.transact_attempts < 1) throw error(error_kind::other, "pool: transact_attempts must be at least 1");
+// The pools this thread has a live conn of.
+thread_local std::vector<const pool*> live_pools;
+
+}  // namespace
+
+const PGresult* await(conn* c, ticket& t) {
+    if (!t.done) {
+        drive(*c->w_, t);
+        c->settle();
+    }
+    if (t.err) throw *t.err;
+    return t.res.get();
 }
 
-std::int64_t affected_rows(const PGresult* r) {
-    // PQcmdTuples only reads the result; its parameter is not const for historical reasons.
+std::string count_error(std::size_t got, std::size_t want) {
+    return "query returned " + std::to_string(got) + " columns, expected " + std::to_string(want);
+}
+
+std::string column_error(std::size_t i, const std::string& name, oid type, std::string_view cxx_type) {
+    return "column " + std::to_string(i + 1) + " \"" + name + "\" has type OID " + std::to_string(type) +
+           ", which " + std::string(cxx_type) + " does not read";
+}
+
+void row_count_error(int rows, const std::string& key) {
+    if (rows == 0) {
+        not_found e("query returned no row");
+        e.sql = text_of(key);
+        throw e;
+    }
+    throw error(error_kind::other, "query returned " + std::to_string(rows) + " rows, expected one",
+                std::string(), text_of(key));
+}
+
+std::int64_t affected_of(const PGresult* r) {
     return std::strtoll(PQcmdTuples(const_cast<PGresult*>(r)), nullptr, 10);
 }
 
-// Runs fixed statements without parameters as one operation.
-void run_plain(session& s, std::initializer_list<std::string_view> sqls) {
-    std::vector<statement> stmts;
-    for (std::string_view q : sqls) stmts.push_back({q, {}, nullptr, false});
-    outcome o = execute(s, stmts);
-    if (o.failure) throw std::move(*o.failure);
-}
-
-std::string savepoint(int level) { return "libpg_sp" + std::to_string(level); }
-
-// Rolls back the transaction (level 1) or to the savepoint of `level`.
-void roll_back(session& s, int level) {
-    if (level == 1) {
-        if (!std::exchange(s.begin_pending, false)) run_plain(s, {"ROLLBACK"});
-        return;
-    }
-    // Two operations: RELEASE cannot even be prepared until ROLLBACK TO has
-    // left the aborted state.
-    run_plain(s, {"ROLLBACK TO SAVEPOINT " + savepoint(level)});
-    run_plain(s, {"RELEASE SAVEPOINT " + savepoint(level)});
-}
-
-}  // namespace
-
-// Drops a broken session the pool still lists as idle or as a read-only
-// session of speculation. When another borrower holds it, that borrower's
-// release drops it instead.
-void evict(pool_state& st, session* s) {
-    bool removed = false;
-    {
-        wakeups wk;
-        std::lock_guard lk(st.mu);
-        const auto it = std::find(st.idle.begin(), st.idle.end(), s);
-        const auto ro = std::find(st.ro.begin(), st.ro.end(), s);
-        if (it != st.idle.end()) {
-            st.idle.erase(it);
-            free_slot(st, wk);
-            removed = true;
-        } else if (ro != st.ro.end()) {
-            st.ro.erase(ro);
-            --st.ro_open;
-            removed = true;
-        }
-    }
-    if (removed) unref(s);
-}
-
-// Drops the caller's owner of a finished floating statement, evicting it when
-// it is broken.
-void settle(pool_state& st, session* s) {
-    if (is_broken(*s)) evict(st, s);
-    unref(s);
-}
-
-namespace {
-
-// Sends the floating statement without a lease when it can: attaches to an idle
-// session, trying a few times when it is leased meanwhile, and leases one when
-// attaching finds nothing or needs a round trip. A leased session is given back
-// as soon as the statement is sent.
-flight send_floating(pool_state& st, const pool_options& o, session*& slot, const statement& stmt) {
-    session* s = slot ? std::exchange(slot, nullptr) : nullptr;
-    if (!s) {
-        for (int tries = 0; tries < 3; ++tries) {
-            s = attach(st, o);
-            if (!s) break;
-            std::pair<pending_ptr, attach_result> r;
-            try {
-                r = execute_begin(*s, stmt, true);
-            } catch (...) {
-                settle(st, s);
-                throw;
-            }
-            if (r.second == attach_result::sent) return {s, std::move(r.first)};
-            settle(st, s);
-            if (r.second == attach_result::needs_lease) break;
-        }
-        s = lend(st, o);
-    }
-    pending_ptr pd;
-    try {
-        pd = execute_begin(*s, stmt, false).first;
-    } catch (...) {
-        release(st, s);
-        throw;
-    }
-    release(st, s);
-    return {s, std::move(pd)};
-}
-
-// Waits for the flight's result and drops its reference; settles even when
-// waiting throws.
-[[gnu::always_inline]] inline outcome land(pool_state& st, flight f) {
-    outcome out;
-    try {
-        out = execute_end(*f.s, std::move(f.pd));
-    } catch (...) {
-        settle(st, f.s);
-        throw;
-    }
-    settle(st, f.s);
-    return out;
-}
-
-}  // namespace
-
-// Sends a floating statement, gives its connection back while it travels and
-// waits for its results. A stale statement is retried once with a fresh lease.
-outcome run_floating(pool_state& st, const pool_options& o, session*& slot, const statement& stmt) {
-    for (int attempt = 0;; ++attempt) {
-        outcome out = land(st, send_floating(st, o, slot, stmt));
-        if (out.stale && attempt == 0) continue;
-        return out;
-    }
-}
-
-// Sends COMMIT, gives the connection back to the pool and waits for the
-// answer, so the next borrower's statements travel right behind it.
-void commit_floating(pool_state& st, const pool_options& o, session*& slot) {
-    const statement commit{"COMMIT", {}, nullptr, false};
-    outcome out = land(st, send_floating(st, o, slot, commit));
-    if (out.failure) throw std::move(*out.failure);
-}
-
-namespace {
-
-// The read-only session a speculation takes: the one with the fewest owners,
-// unless it is stalled or shared and a new one may still be opened. Opens one
-// then (outside the pool lock); a refused or failed connect is a skip. The
-// caller counts itself as an owner of the result. Nullptr: nothing usable.
-session* ro_session(pool_state& st, const pool_options& o) {
-    const int cap = std::max(1, o.max_conns / 4);
-    gate g = gate::normal;
-    {
-        std::lock_guard lk(st.mu);
-        if (!st.ro.empty()) {
-            const auto [it, stalled] = pick_idle(st.ro, now_ns());
-            const bool shared = (*it)->refs.load(std::memory_order_relaxed) > 1;
-            if (!stalled && (!shared || st.ro_open >= cap)) {
-                ref(**it);
-                return *it;
-            }
-        }
-        if (st.ro_open >= cap || (g = may_connect(st)) == gate::refused) return nullptr;
-        ++st.ro_open;
-    }
-    try {
-        session* s = open_session(o, clock::now() + o.acquire_timeout, "-c default_transaction_read_only=on -c statement_timeout=250");
-        std::lock_guard lk(st.mu);
-        note_connect_success(st);
-        ref(*s);
-        st.ro.push_back(s);
-        return s;
-    } catch (const error&) {
-        std::lock_guard lk(st.mu);
-        note_connect_failure(st, o, g);
-        --st.ro_open;
-        return nullptr;
-    }
-}
-
-}  // namespace
-
-// The prefetch statements of a scope in flight as one operation on a read-only
-// session: the server refuses every write in them.
-struct speculation {
-    std::vector<batch_item> items;
-    std::shared_ptr<const void> keep;  // keeps the items' texts
-    std::vector<statement> stmts;
-    pool_state* st = nullptr;
-    flight f;
-    bool landed = false;
-
-    ~speculation() {
-        if (landed || !f.s) return;
-        try {
-            land(*st, std::move(f));
-        } catch (...) {
-            // Its outcome is not wanted; waiting only keeps its ticket alive.
-        }
-    }
-};
-
-std::shared_ptr<speculation> speculate(pool_state& st, const pool_options& o, std::vector<batch_item> items,
-                                       std::shared_ptr<const void> keep) {
-    auto x = std::make_shared<speculation>();
-    x->items = std::move(items);
-    x->keep = std::move(keep);
-    x->stmts.reserve(x->items.size());
-    for (const batch_item& b : x->items) x->stmts.push_back({b.text, b.params, nullptr, false});
-    x->st = &st;
-    for (int tries = 0; tries < 3; ++tries) {
-        session* s = ro_session(st, o);
-        if (!s) return nullptr;
-        std::pair<pending_ptr, attach_result> r;
-        try {
-            r = execute_begin_contained(*s, x->stmts);
-        } catch (...) {
-            settle(st, s);
-            throw;
-        }
-        if (r.second == attach_result::sent) {
-            x->f = {s, std::move(r.first)};
-            return x;
-        }
-        settle(st, s);
-    }
-    return nullptr;
-}
-
-landed_batch land_speculation(speculation& x) {
-    landed_batch out;
-    const std::size_t n = x.items.size();
-    out.failed = n;
-    if (x.landed) return out;
-    x.landed = true;
-    outcome o;
-    try {
-        o = land(*x.st, std::move(x.f));
-    } catch (error& e) {
-        out.failure = std::move(e);
-        return out;
-    } catch (...) {
-        out.failure = error(error_kind::other, "prefetch: the batch could not be read");
-        return out;
-    }
-    if (o.failure) {
-        out.failure = std::move(*o.failure);
-        out.failed = std::min(o.failed, n);
-    }
-    out.results = std::move(o.results);
-    out.results.resize(n);
-    return out;
-}
-
-std::int64_t affected_of(const reply& rp) { return affected_rows(rp.r.get()); }
-
-const sql& sent_sql(const sent& x) { return x.q; }
-
-// Waits for a sent statement's result and records it; never throws.
-void finish(sent& x) {
-    if (x.out) return;
-    try {
-        x.out = land(*x.st, std::move(x.f));
-    } catch (error& e) {
-        x.out = outcome{};
-        x.out->failure = e;
-    }
-    if (x.out->stale && !x.held) {
-        session* none = nullptr;
-        try {
-            x.out = run_floating(*x.st, *x.opts, none, x.stmt);
-        } catch (error& e) {
-            x.out = outcome{};
-            x.out->failure = e;
-        }
-    }
-    if (x.out->failure && x.out->failure->sql.empty()) x.out->failure->sql = std::string(x.stmt.sql);
-}
-
-reply take(sent& x) {
-    finish(x);
-    if (x.taken) throw error(error_kind::other, "pending: the result was already read");
-    x.taken = true;
-    if (x.out->failure) throw error(*x.out->failure);
-    column_desc cols = std::move(x.out->columns.front());
-    return {std::move(x.out->results.front()), columns_of(cols), std::move(cols), {}};
-}
-
-session& session_of(conn& c) {
-    c.end_scope();
-    session& s = c.pin();
-    drain(s);
-    return s;
+void backoff(int attempt) {
+    thread_local std::minstd_rand rng(std::random_device{}());
+    const int full_us = 5'000 << std::min(attempt - 1, 10);
+    std::this_thread::sleep_for(
+        std::chrono::microseconds(std::uniform_int_distribution<int>(full_us / 2, full_us)(rng)));
 }
 
 std::int64_t exec_on(conn& c, const sql& q) { return c.exec(q); }
 
-bool in_transaction(conn& c) { return c.in_transaction(); }
-
-namespace {
-
-// The key of a table's column list in the COPY type cache.
-std::string copy_key(std::string_view table, std::span<const std::string_view> names) {
-    std::string key(table);
-    for (std::string_view name : names) {
-        key.push_back('\0');
-        key.append(name);
+std::int64_t copy_on(conn& c, std::string_view table, std::span<const copy_column> cols, const std::string& data) {
+    if (cols.empty()) throw error(error_kind::other, "insert_all: no column to insert, every field is unset");
+    const on_exit s{[&c] { c.settle(); }};
+    sql names;
+    for (const auto& col : cols) names += (names.empty() ? sql{} : sql{", "}) + ident(col.name);
+    const std::string key = key_of(sql{"SELECT {} FROM {} LIMIT 0", names, ident(table)}.render().text, {});
+    // A cached description that does not fit may be stale: describe the columns again once.
+    for (bool fresh = false;; fresh = true) {
+        wire& w = c.hold();
+        std::unique_lock lk(w.mu);
+        if (fresh) w.cache.erase(key);
+        const std::vector<oid>& types = c.lookup(w, lk, key, {}, nullptr).types;
+        std::size_t k = 0;
+        while (k < cols.size() && cols[k].accepts(types[k])) ++k;
+        if (k == cols.size()) break;
+        if (fresh) throw error(error_kind::other, "insert_all: " + column_error(k, std::string(cols[k].name), types[k], cols[k].type));
     }
-    return key;
-}
-
-// A text[] literal of the names, quoting and escaping each.
-std::string text_array(std::span<const std::string_view> names) {
-    std::string array = "{";
-    for (std::size_t i = 0; i < names.size(); ++i) {
-        if (i) array += ',';
-        array += '"';
-        for (char ch : names[i]) {
-            if (ch == '"' || ch == '\\') array += '\\';
-            array += ch;
-        }
-        array += '"';
+    const std::string text = sql{"COPY {} ({}) FROM STDIN (FORMAT binary)", ident(table), names}.render().text;
+    wire& w = c.quiet();
+    std::unique_ptr<PGresult, result_deleter> r(PQexec(w.c, text.c_str()));
+    if (PQresultStatus(r.get()) == PGRES_COPY_IN) {
+        bool ok = true;
+        for (std::size_t at = 0, chunk = 1 << 20; ok && at < data.size(); at += chunk)
+            ok = PQputCopyData(w.c, data.data() + at, static_cast<int>(std::min(chunk, data.size() - at))) == 1;
+        if (ok) PQputCopyEnd(w.c, nullptr);
+        r.reset(PQgetResult(w.c));
+        while (PGresult* more = PQgetResult(w.c)) PQclear(more);
     }
-    array += '}';
-    return array;
-}
-
-std::int64_t send_inserts(conn& c, std::span<const sql> rows) {
-    std::vector<pg::pending<>> pendings;
-    pendings.reserve(rows.size());
-    for (const sql& q : rows) pendings.push_back(c.send(q));
-    std::int64_t n = 0;
-    for (auto& p : pendings) n += p.affected();
-    return n;
-}
-
-}  // namespace
-
-std::vector<copy_target> copy_targets(conn& c, std::string_view table, std::span<const std::string_view> names) {
-    pool_state& st = c.state();
-    const std::string key = copy_key(table, names);
-    {
-        std::lock_guard lk(st.mu);
-        if (const auto it = st.copy_types.find(key); it != st.copy_types.end()) return it->second;
-    }
-    const sql q{
-        "SELECT b.oid::int8, b.typcategory::text, b.typtype::text "
-        "FROM unnest({}::text[]) WITH ORDINALITY AS c(name, i) "
-        "JOIN pg_attribute a ON a.attrelid = {}::regclass AND a.attname = c.name AND NOT a.attisdropped "
-        "JOIN pg_type t ON t.oid = a.atttypid "
-        "JOIN pg_type b ON b.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.oid END "
-        "ORDER BY c.i",
-        text_array(names), quote_ident(table)};
-    const auto rows = c.query<std::int64_t, std::string, std::string>(q);
-    std::vector<copy_target> got;
-    if (rows.size() != names.size()) return got;
-    got.reserve(rows.size());
-    for (const auto& row : rows) {
-        const std::string& category = std::get<1>(row);
-        const std::string& kind = std::get<2>(row);
-        got.push_back({static_cast<oid>(std::get<0>(row)), static_cast<char>(category.empty() ? 0 : category[0]),
-                       static_cast<char>(kind.empty() ? 0 : kind[0])});
-    }
-    {
-        std::lock_guard lk(st.mu);
-        st.copy_types.emplace(key, got);
-    }
-    return got;
-}
-
-void forget_copy_targets(conn& c, std::string_view table, std::span<const std::string_view> names) {
-    pool_state& st = c.state();
-    std::lock_guard lk(st.mu);
-    st.copy_types.erase(copy_key(table, names));
-}
-
-std::int64_t copy_rows(conn& c, std::string_view copy_sql, std::string_view body) {
-    if (c.in_transaction()) return copy_in(c.hold(), copy_sql, body);
-    transaction tx(c);
-    const std::int64_t n = copy_in(c.hold(), copy_sql, body);
-    tx.commit();
-    return n;
-}
-
-std::int64_t insert_rows(conn& c, std::span<const sql> rows) {
-    if (c.in_transaction()) return send_inserts(c, rows);
-    transaction tx(c);
-    const std::int64_t n = send_inserts(c, rows);
-    tx.commit();
-    return n;
-}
-
-std::string column_mismatch(std::size_t col, const type_desc& t) {
-    const std::string type = t.name.empty() ? "oid " + std::to_string(t.id) : std::string(t.name);
-    return "result column " + std::to_string(col + 1) + " has type " + type +
-           ", which the requested C++ type cannot read";
-}
-
-void throw_row_count(std::size_t rows, const sql& q) {
-    if (rows == 0) {
-        not_found e("query returned no row");
-        e.sql = q.render().text;
-        throw e;
-    }
-    throw error(error_kind::other, "query returned " + std::to_string(rows) + " rows, expected one", {},
-                q.render().text);
-}
-
-void transact_backoff(int next) {
-    const auto seed = static_cast<unsigned>(clock::now().time_since_epoch().count());
-    std::minstd_rand rng(seed ^ static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
-    const int base = 5 << std::min(next - 2, 6);  // ms: 5, 10, 20 ... 320
-    std::this_thread::sleep_for(std::chrono::milliseconds(base + static_cast<int>(rng() % static_cast<unsigned>(base))));
+    w.broken = PQstatus(w.c) != CONNECTION_OK;  // nothing else is queued on it
+    if (w.broken) throw error(error_kind::broken, message(w.c), std::string(), text);
+    if (PQresultStatus(r.get()) == PGRES_COMMAND_OK) return affected_of(r.get());
+    w.cache.erase(key);  // the description may be stale: the next call describes the columns again
+    throw server_error(r.get(), text);
 }
 
 }  // namespace detail
 
-pool::pool(pool_options o) : opts_(std::move(o)), st_(std::make_unique<detail::pool_state>()) {
-    detail::check_options(opts_);
-}
+namespace detail {
 
-pool::~pool() {
-    {
-        std::lock_guard lk(st_->mu);
-        if (st_->leased != 0) {
-            std::fputs("pg::pool destroyed while connections are borrowed\n", stderr);
-            std::terminate();
-        }
-        for (detail::session* s : st_->idle) detail::unref(s);
-        for (detail::session* s : st_->ro) detail::unref(s);
-        st_->stopping = true;
+// A pool's wires and the borrowers waiting for one, under one mutex.
+struct lot {
+    const pool_options& o;
+    std::mutex mu{};
+    std::vector<std::unique_ptr<wire>> wires{};
+    std::deque<waiter*> waiters{};  // oldest first
+    int open = 0;                 // wires and the ones being opened
+    std::uint64_t borrows = 0;
+
+    // The wire a new borrower may take: for a shared one the least used, for an
+    // exclusive one an unused one; never one held, reserved or lost.
+    wire* lightest(bool exclusive) const {
+        wire* best = nullptr;
+        for (const auto& w : wires)
+            if (w->users >= 0 && !w->reserved && !w->broken && (!exclusive || w->users == 0) &&
+                (!best || w->users < best->users))
+                best = w.get();
+        return best;
     }
-    st_->keeper_cv.notify_one();
-    if (st_->keeper.joinable()) st_->keeper.join();
-}
+
+    wire* take(wire* w, bool exclusive) {
+        ++borrows;
+        w->users = exclusive ? -1 : w->users + 1;
+        return w;
+    }
+
+    // Lets the oldest waiter look again: a slot was freed or the queue moved.
+    void wake() { if (!waiters.empty()) waiters.front()->cv.notify_one(); }
+
+    // Hands w to the oldest waiters: to shared ones while they come first, to an
+    // exclusive one when nobody uses w; otherwise reserves w for that one. Then
+    // the waiter now oldest looks again.
+    void serve(wire* w) {
+        while (!waiters.empty() && w->users >= 0) {
+            waiter* h = waiters.front();
+            if (h->exclusive && w->users > 0) {
+                w->reserved = true;
+                break;
+            }
+            waiters.pop_front();
+            h->got = take(w, h->exclusive);
+            h->cv.notify_one();
+        }
+        wake();
+    }
+
+    // Opens a wire (its slot counted while the lock is released) and takes it.
+    wire* connect(std::unique_lock<std::mutex>& lk, bool exclusive) {
+        ++open;
+        lk.unlock();
+        auto w = std::make_unique<wire>(PQconnectdb(o.dsn.c_str()));
+        const bool ok = PQstatus(w->c) == CONNECTION_OK && PQsetnonblocking(w->c, 1) == 0 && PQenterPipelineMode(w->c);
+        lk.lock();
+        if (!ok) {
+            --open;
+            wake();
+            throw error(error_kind::connect_failed, message(w->c));
+        }
+        wires.push_back(std::move(w));
+        wire* got = take(wires.back().get(), exclusive);
+        serve(got);
+        return got;
+    }
+
+    // A shared borrower takes an unused wire, else opens one while open <
+    // max_conns, else shares the least used. An exclusive one takes an unused
+    // wire, else opens one, else waits and reserves the least used; waiters are
+    // served oldest first.
+    wire* acquire(bool exclusive) {
+        std::unique_lock lk(mu);
+        waiter me{exclusive, nullptr, {}};
+        const auto deadline = std::chrono::steady_clock::now() + o.acquire_timeout;
+        for (bool queued = false; !me.got;) {
+            if (!queued || waiters.front() == &me) {
+                wire* w = lightest(exclusive);
+                const bool room = open < o.max_conns;
+                if (w && w->users > 0 && room) w = nullptr;  // a new wire before sharing a busy one
+                if (w || room) {
+                    if (queued) waiters.pop_front(), wake();
+                    return w ? take(w, exclusive) : connect(lk, exclusive);
+                }
+            }
+            if (!queued) {
+                queued = true;
+                waiters.push_back(&me);
+                if (wire* busy = exclusive ? lightest(false) : nullptr) busy->reserved = true;
+            }
+            if (me.cv.wait_until(lk, deadline) == std::cv_status::timeout && !me.got) {
+                std::erase(waiters, &me);
+                wake();
+                throw error(error_kind::other, "no connection free within acquire_timeout (" +
+                                                   std::to_string(o.acquire_timeout.count()) + " ms)");
+            }
+        }
+        return me.got;
+    }
+
+    // Gives back a shared or held wire; one nobody uses goes to the waiters, or is
+    // closed when it is lost, not idle, or was handed out by raw().
+    void release(wire* w, bool exclusive) {
+        std::unique_ptr<wire> dead;  // closed after the lock is released
+        std::lock_guard lk(mu);
+        w->users = exclusive ? 0 : w->users - 1;
+        if (w->users > 0) return;
+        w->reserved = false;
+        if (!w->broken && !w->raw && PQstatus(w->c) == CONNECTION_OK && PQtransactionStatus(w->c) == PQTRANS_IDLE)
+            return serve(w);
+        const auto it = std::ranges::find_if(wires, [&](const auto& x) { return x.get() == w; });
+        dead = std::move(*it);
+        wires.erase(it);
+        --open;
+        wake();
+    }
+};
+
+}  // namespace detail
+
+pool::pool(pool_options o) : opts_(std::move(o)), lot_(new detail::lot{opts_}) {}
+pool::~pool() = default;
 
 pool_stats pool::stats() const {
-    pool_stats out;
-    {
-        std::lock_guard lk(st_->mu);
-        out = {st_->open,
-               static_cast<int>(st_->idle.size()),
-               st_->leased,
-               static_cast<int>(st_->waiters.size()),
-               st_->borrows.load(std::memory_order_relaxed),
-               st_->connect_failures,
-               st_->breaker_open};
-    }
-    detail::prefetch_counts(st_->prefetch, out);
-    return out;
-}
-
-bool pool::ready() {
-    const pool_stats s = stats();
-    if (s.breaker_open) return false;
-    if (s.open > 0) return true;
-    try {
-        conn c(*this);
-        c.exec(sql{"SELECT 1"});
-        return true;
-    } catch (const error&) {
-        return false;
-    }
+    std::lock_guard lk(lot_->mu);
+    const auto idle = std::ranges::count_if(lot_->wires, [](const auto& w) { return w->users == 0; });
+    return {lot_->open, static_cast<int>(idle), static_cast<int>(lot_->waiters.size()), lot_->borrows};
 }
 
 conn::conn(pool& p) : p_(&p) {
-    if (std::ranges::find(detail::held_pools, &p) != detail::held_pools.end())
-        throw nested_borrow("this thread already holds a connection of this pool");
-    s_ = detail::lend_unless_idle(*p.st_, p.opts_);
-    p.st_->borrows.fetch_add(1, std::memory_order_relaxed);
-    detail::held_pools.push_back(&p);
+    if (std::ranges::find(detail::live_pools, &p) != detail::live_pools.end())
+        throw nested_borrow("this thread already holds a conn of this pool");
+    detail::live_pools.push_back(&p);
 }
 
 conn::~conn() {
-    end_scope();
-    if (pf_) detail::recycle(std::move(pf_));
-    settle_sent(false);
-    std::erase(detail::held_pools, p_);
-    if (s_) detail::release(*p_->st_, s_);
-}
-
-detail::session& conn::hold() {
-    if (!s_) s_ = detail::lend(*p_->st_, p_->opts_);
-    return *s_;
-}
-
-detail::session& conn::pin() {
-    detail::session& s = hold();
-    pinned_ = true;
-    return s;
-}
-
-detail::pool_state& conn::state() { return *p_->st_; }
-
-std::shared_ptr<detail::sent> conn::start(const sql& q, detail::check_fn check) {
-    end_scope();
-    return send_unscoped(q, check);
-}
-
-std::shared_ptr<detail::sent> conn::send_unscoped(const sql& q, detail::check_fn check) {
-    auto x = std::make_shared<detail::sent>();
-    x->q = q;
-    x->r = x->q.render();
-    x->stmt = detail::statement{x->r.text, x->r.params, check, false};
-    x->st = p_->st_.get();
-    x->opts = &p_->opts_;
-    std::erase_if(sent_, [](const std::shared_ptr<detail::sent>& s) { return s->out.has_value(); });
-    const bool pins = detail::pins_of(x->q, x->r.text);
-    if (keeps(pins)) {
-        detail::session& s = own(pins);
-        x->f = {&s, detail::execute_begin(s, x->stmt, false).first};
-        x->held = true;
-    } else {
-        x->f = detail::send_floating(*p_->st_, p_->opts_, s_, x->stmt);
+    if (w_) {
+        detail::drain(*w_);
+        p_->lot_->release(w_, true);
     }
-    sent_.push_back(x);
-    return x;
+    std::erase(detail::live_pools, p_);
 }
 
-std::optional<error> conn::settle_sent(bool held_only) {
-    for (const auto& x : sent_) {
-        if (held_only && !x->held) continue;
-        detail::finish(*x);
+detail::wire& conn::hold() {
+    if (!w_) w_ = p_->lot_->acquire(true);
+    return *w_;
+}
+
+void conn::settle() {
+    const auto empty = [this] {
+        std::lock_guard lk(w_->mu);
+        return w_->queue.empty();
+    };
+    if (w_ && sent_ == 0 && !w_->raw && empty()) p_->lot_->release(std::exchange(w_, nullptr), true);
+}
+
+// Sends the guards' pending BEGIN / SAVEPOINTs, what `send` sends, and a Sync;
+// the caller holds w.mu.
+template <class F>
+std::shared_ptr<detail::ticket> conn::queue(detail::wire& w, std::string key, F&& send) {
+    if (w.broken) throw error(error_kind::broken, "the connection was lost", std::string(), detail::text_of(key));
+    auto t = std::make_shared<detail::ticket>();
+    t->key = std::move(key);
+    w.shared = w_ != &w;
+    bool ok = PQsetnonblocking(w.c, 1) == 0 && PQenterPipelineMode(w.c);
+    for (; ok && sent_ < depth_; ++sent_)
+        ok = detail::command(w.c, sent_ == 0 ? "BEGIN" : "SAVEPOINT libpg_" + std::to_string(sent_ + 1));
+    ok = ok && send(w.c) && PQpipelineSync(w.c);
+    if (ok) {
+        w.queue.push_back(t);
+        return t;
     }
-    std::optional<error> first;
-    std::erase_if(sent_, [&](const std::shared_ptr<detail::sent>& x) {
-        if ((held_only && !x->held) || !x->out) return false;
-        if (!x->taken && x->out->failure && !first) first = *x->out->failure;
-        return true;
-    });
-    return first;
+    // libpq refused it: t fails alone. What libpq buffered may end in part of t, so
+    // the wire takes no new ticket and is closed once the tickets before t are read.
+    const bool lost = PQstatus(w.c) != CONNECTION_OK;
+    t->err.emplace(lost ? error_kind::broken : error_kind::other, detail::message(w.c), std::string(),
+                   detail::text_of(t->key));
+    t->done = true;
+    w.broken = true;
+    if (lost) detail::lose(w, error_kind::broken, detail::message(w.c));
+    return t;
 }
 
-[[gnu::always_inline]] inline detail::reply conn::run_text(std::string_view text, std::span<const detail::param> params,
-                             detail::check_fn check, bool pins, detail::param_types* types) {
-    const detail::statement st{text, params, check, types != nullptr};
-    const bool held = keeps(pins);
-    try {
-        detail::outcome o = held ? detail::execute(own(pins), {&st, 1})
-                                 : detail::run_floating(*p_->st_, p_->opts_, s_, st);
-        if (o.failure) {
-            if (held) {
-                if (auto unread = settle_sent(true)) throw *unread;
+// The checked prepared statement of `key` on w; on a miss it is prepared and
+// described first (w.mu is released while that round trip is read).
+detail::prepared& conn::lookup(detail::wire& w, std::unique_lock<std::mutex>& lk, const std::string& key,
+                               std::span<const detail::param> params, detail::check_fn check) {
+    for (bool fresh = false;; fresh = true) {
+        if (const auto it = w.cache.find(key); it != w.cache.end()) {
+            detail::prepared& p = it->second;
+            const std::string bad = check && p.checked != check ? check(p.types, p.names) : std::string();
+            if (bad.empty()) {
+                if (check) p.checked = check;
+                return p;
             }
-            throw std::move(*o.failure);
+            if (fresh) throw error(error_kind::other, bad, std::string(), detail::text_of(key));
+            w.cache.erase(it);  // a cached description that fails the check may be stale: describe it again
         }
-        if (types && !o.types.empty()) *types = std::move(o.types.front());
-        detail::column_desc cols = std::move(o.columns.front());
-        return {std::move(o.results.front()), detail::columns_of(cols), std::move(cols), {}};
-    } catch (error& e) {
-        if (e.sql.empty()) e.sql = std::string(text);
-        throw;
+        if (w.cache.size() >= 1000) {
+            w.cache.clear();
+            ++w.clears;
+            queue(w, "DEALLOCATE ALL", [](PGconn* c) { return detail::command(c, "DEALLOCATE ALL"); });
+        }
+        std::vector<oid> types;
+        for (const auto& p : params) types.push_back(p.type);
+        const std::string name = "s" + std::to_string(++w.names);
+        const std::uint64_t clears = w.clears;
+        const auto t = queue(w, key, [&](PGconn* c) {
+            return PQsendPrepare(c, name.c_str(), key.c_str(), static_cast<int>(types.size()), types.data()) &&
+                   PQsendDescribePrepared(c, name.c_str());
+        });
+        // On a held wire the tickets before t are this conn's: the earliest failure is the one thrown.
+        const auto seq = w_ == &w ? w.queue : std::deque{t};
+        lk.unlock();
+        detail::drive(w, *t);
+        lk.lock();
+        if (t->err) {
+            const auto first = std::ranges::find_if(seq, [](const auto& e) { return e->err.has_value(); });
+            throw first == seq.end() ? *t->err : *(*first)->err;
+        }
+        if (w.clears != clears) continue;  // DEALLOCATE ALL went out after it: prepare again
+        detail::prepared p{name, {}, {}, nullptr};
+        for (int i = 0; i < PQnfields(t->res.get()); ++i) {
+            p.types.push_back(PQftype(t->res.get(), i));
+            p.names.emplace_back(PQfname(t->res.get(), i));
+        }
+        w.cache.insert_or_assign(key, std::move(p));
     }
 }
 
-detail::reply conn::run(const sql& q, detail::check_fn check) {
-    rendered r = q.render();
-    const bool pins = detail::pins_of(q, r.text);
-    if (p_->opts_.prefetch && !p_->opts_.pooler) [[unlikely]] return prefetched(q, r, check, pins);
-    return run_text(r.text, r.params, check, pins);
+// A statement read at once on a conn that holds no wire shares a wire for as
+// long as it runs; anything else runs on the conn's held wire.
+std::shared_ptr<detail::ticket> conn::start(const sql& q, detail::check_fn check, bool now) {
+    const rendered r = q.render();
+    if (r.params.size() > 65535)
+        throw error(error_kind::other, "a statement takes at most 65535 parameters", std::string(), r.text);
+    std::string key = detail::key_of(r.text, r.params);
+    const bool shared = !w_ && depth_ == 0 && now;
+    detail::wire& w = shared ? *p_->lot_->acquire(false) : hold();
+    const detail::on_exit done{[&] { shared ? p_->lot_->release(&w, false) : settle(); }};
+    std::unique_lock lk(w.mu);
+    const detail::prepared& p = lookup(w, lk, key, r.params, check);
+    w.values.clear();
+    w.lengths.clear();
+    w.formats.assign(r.params.size(), 1);
+    for (const auto& prm : r.params) {
+        w.values.push_back(prm.bytes ? prm.bytes->data() : nullptr);
+        w.lengths.push_back(prm.bytes ? static_cast<int>(prm.bytes->size()) : 0);
+    }
+    const auto t = queue(w, std::move(key), [&](PGconn* c) {
+        return PQsendQueryPrepared(c, p.name.c_str(), static_cast<int>(r.params.size()), w.values.data(),
+                                   w.lengths.data(), w.formats.data(), 1);
+    });
+    lk.unlock();
+    if (now) detail::drive(w, *t);
+    return t;
 }
 
-detail::reply conn::run_unscoped(const rendered& r, detail::check_fn check, bool pins, detail::param_types* types) {
-    return run_text(r.text, r.params, check, pins, types);
+// The held wire with every statement read and the guards' BEGIN / SAVEPOINT
+// sent, out of pipeline mode and blocking.
+detail::wire& conn::quiet() {
+    detail::wire& w = hold();
+    if (sent_ < depth_) {
+        std::lock_guard lk(w.mu);
+        queue(w, "", [](PGconn*) { return 1; });
+    }
+    detail::drain(w);
+    if (w.broken) throw error(error_kind::broken, "the connection was lost");
+    if (!PQexitPipelineMode(w.c) || PQsetnonblocking(w.c, 0) != 0) throw error(error_kind::other, detail::message(w.c));
+    return w;
 }
-
-bool conn::sending() const {
-    return std::any_of(sent_.begin(), sent_.end(), [](const std::shared_ptr<detail::sent>& x) { return !x->out; });
-}
-
-namespace detail {
-reply run_text(conn& c, std::string_view text, std::span<const param> params, check_fn check) {
-    c.end_scope();
-    return c.run_text(text, params, check, false);
-}
-}  // namespace detail
-
-std::int64_t conn::exec(const sql& q) { return detail::affected_rows(run(q, nullptr).r.get()); }
-
-bool conn::in_transaction() const { return s_ && s_->depth > 0; }
 
 PGconn* conn::raw() {
-    end_scope();
-    detail::session& s = pin();
-    detail::drain(s);
-    return s.c;
+    const detail::on_exit s{[this] { settle(); }};
+    detail::wire& w = quiet();
+    w.raw = true;
+    return w.c;
 }
 
-transaction::transaction(conn& c) : c_(c), level_(0) {
-    c.end_scope();
-    detail::session& s = c.hold();
-    level_ = s.depth + 1;
-    if (level_ == 1 && !detail::idle(s)) throw error(error_kind::other, "transaction: connection is not idle");
-    if (level_ == 1) s.begin_pending = true;
-    else detail::run_plain(s, {"SAVEPOINT " + detail::savepoint(level_)});
-    s.depth = level_;
-}
-
-transaction::~transaction() {
-    if (!open_) return;
-    detail::session& s = *c_.s_;
-    s.depth = level_ - 1;
-    c_.settle_sent(true);
+std::optional<error> conn::control(const std::vector<std::string>& commands) {
     try {
-        detail::roll_back(s, level_);
-    } catch (const error&) {
-        // The connection is broken or left in a transaction; the pool discards it.
+        std::shared_ptr<detail::ticket> t;
+        {
+            std::lock_guard lk(w_->mu);
+            t = queue(*w_, commands.front(), [&](PGconn* c) {
+                return std::ranges::all_of(commands, [&](const std::string& s) { return detail::command(c, s) != 0; });
+            });
+        }
+        detail::drive(*w_, *t);
+        return t->err;
+    } catch (const error& e) {
+        return e;
     }
+}
+
+void conn::end_tx(int level, bool commit) {
+    depth_ = level - 1;
+    if (level > sent_) return settle();  // the guard sent nothing
+    const std::string sp = "SAVEPOINT libpg_" + std::to_string(level);
+    std::optional<error> failed;
+    if (commit) {
+        const std::optional<error> unread = detail::drain(*w_);
+        if (!w_->broken && PQtransactionStatus(w_->c) == PQTRANS_INTRANS) {
+            failed = control({level == 1 ? "COMMIT" : "RELEASE " + sp});
+            if (!failed || level == 1) {  // a failed COMMIT ended the transaction
+                sent_ = level - 1;
+                settle();
+                if (failed && failed->kind == error_kind::broken) throw commit_unknown(failed->what());
+                if (failed) throw *failed;
+                return;
+            }
+        } else {
+            failed = unread ? *unread
+                            : error(w_->broken ? error_kind::broken : error_kind::other,
+                                    w_->broken ? "the connection was lost"
+                                               : "the transaction is no longer open: an earlier statement failed or ended it");
+        }
+    }
+    if (PQtransactionStatus(w_->c) != PQTRANS_IDLE) {
+        if (level == 1) control({"ROLLBACK"});
+        else control({"ROLLBACK TO " + sp, "RELEASE " + sp});
+    }
+    sent_ = level - 1;
+    settle();
+    if (failed) throw *failed;
 }
 
 void transaction::commit() {
-    detail::session& s = *c_.s_;
-    if (!open_) throw error(error_kind::other, "transaction: already committed");
-    if (s.depth != level_) throw error(error_kind::other, "transaction: an inner transaction is still open");
+    if (!open_ || level_ != c_.depth_)
+        throw error(error_kind::other, "commit of a guard that is closed or has an inner guard open");
     open_ = false;
-    s.depth = level_ - 1;
-    if (level_ == 1 && std::exchange(s.begin_pending, false)) return;
-    if (level_ == 1 && !c_.pinned_ && !detail::in_error(s) && !detail::is_broken(s)) {
-        std::optional<error> commit_failed;
+    c_.end_tx(level_, true);
+}
+
+transaction::~transaction() {
+    if (open_ && level_ == c_.depth_) {
         try {
-            detail::commit_floating(*c_.p_->st_, c_.p_->opts_, c_.s_);
-        } catch (const error& e) {
-            commit_failed = e;
+            c_.end_tx(level_, false);
+        } catch (...) {
         }
-        if (auto unread = c_.settle_sent(true)) throw *unread;
-        if (commit_failed) {
-            if (commit_failed->kind == error_kind::broken || commit_failed->kind == error_kind::deadline)
-                throw commit_unknown(commit_failed->what());
-            throw *commit_failed;
-        }
-        return;
-    }
-    if (auto unread = c_.settle_sent(true)) {
-        detail::roll_back(s, level_);
-        throw *unread;
-    }
-    if (detail::in_error(s)) {
-        detail::roll_back(s, level_);
-        throw error(error_kind::other, "transaction: a statement failed; the transaction was rolled back");
-    }
-    if (level_ > 1) return detail::run_plain(s, {"RELEASE SAVEPOINT " + detail::savepoint(level_)});
-    if (detail::is_broken(s)) detail::throw_unusable();
-    try {
-        detail::run_plain(s, {"COMMIT"});
-    } catch (const error& e) {
-        if (e.kind == error_kind::broken || e.kind == error_kind::deadline) throw commit_unknown(e.what());
-        throw;
     }
 }
 

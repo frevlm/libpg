@@ -34,7 +34,7 @@ UPDATE users SET points = points + :delta WHERE id = :id
 RETURNING old.points AS before, new.points AS after, points;
 
 -- name: rollup_totals :many
-SELECT group_id, count(*) AS n FROM memberships GROUP BY ROLLUP (group_id) ORDER BY group_id;
+SELECT group_id AS "group_id?", count(*) AS n FROM memberships GROUP BY ROLLUP (group_id) ORDER BY group_id;
 
 -- name: left_join_false :many
 SELECT u.id AS user_id, g.id AS group_id FROM users u LEFT JOIN groups g ON false ORDER BY u.id;

@@ -1,12 +1,13 @@
-// pg_bench: benchmarks of libpg and of raw-libpq prototypes of its engine.
+// pg_bench: benchmarks of libpg and of raw-libpq baselines.
 //   pg_bench [--dsn DSN] [--duration S] [--threads "1 2 4"] [--pool "8 16"]
-//            [--pc-threads "8 16"] [--pc-pool "4 8"] [--pooler] [--list] [SCENARIO...]
+//            [--pc-threads "8 16"] [--pc-pool "4 8"] [--list] [SCENARIO...]
 //   pg_bench --summarize results.csv        (markdown report on stdout)
 // Every measured point prints: scenario,threads,pool,ops_per_sec,p50_us,p99_us,p999_us,extra
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <string>
 
 #include "harness.hpp"
 #include "pg/pg.hpp"
@@ -18,7 +19,7 @@ using bench::Scenario;
 
 [[noreturn]] void usage() {
     std::fputs("usage: pg_bench [--dsn DSN] [--duration S] [--threads L] [--pool L] [--pc-threads L] "
-               "[--pc-pool L] [--pooler] [--list] [SCENARIO...]\n       pg_bench --summarize results.csv\n",
+               "[--pc-pool L] [--list] [SCENARIO...]\n       pg_bench --summarize results.csv\n",
                stderr);
     std::exit(2);
 }
@@ -29,6 +30,16 @@ struct Args {
     bool list = false;
     std::string summarize;
 };
+
+// Session settings travel in the DSN. A DSN without an options parameter gets the
+// ones the 0.3.0 pool set at connect, so that both builds run with the same server settings.
+std::string with_session_options(const std::string& dsn) {
+    if (dsn.find("options=") != std::string::npos) return dsn;
+    if (dsn.starts_with("postgresql://") || dsn.starts_with("postgres://"))
+        return dsn + (dsn.find('?') == std::string::npos ? '?' : '&') +
+               "options=-c%20statement_timeout%3D30s%20-c%20synchronous_commit%3Doff";
+    return dsn + " options='-c statement_timeout=30s -c synchronous_commit=off'";
+}
 
 Args parse(int argc, char** argv) {
     Args a;
@@ -45,12 +56,12 @@ Args parse(int argc, char** argv) {
         else if (arg == "--pool") a.cfg.pools = bench::parse_list(value());
         else if (arg == "--pc-threads") a.cfg.pc_threads = bench::parse_list(value());
         else if (arg == "--pc-pool") a.cfg.pc_pools = bench::parse_list(value());
-        else if (arg == "--pooler") a.cfg.pooler = true;
         else if (arg == "--list") a.list = true;
         else if (arg == "--summarize") a.summarize = value();
         else if (arg.starts_with("--")) usage();
         else a.names.push_back(arg);
     }
+    a.cfg.dsn = with_session_options(a.cfg.dsn);
     return a;
 }
 
@@ -84,8 +95,11 @@ int main(int argc, char** argv) {
         if (!a.summarize.empty()) return bench::summarize(a.summarize);
         std::vector<Scenario> all;
         bench::register_raw(all);
-        bench::register_v1(all);
+        bench::register_pool(all);
         bench::register_v2(all);
+#ifdef BENCH_WRITEBACK
+        bench::register_wb(all);
+#endif
         bench::register_list(all);
         bench::register_real(all);
         if (a.list) {

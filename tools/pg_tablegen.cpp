@@ -1,15 +1,15 @@
 // pg_tablegen DSN schema.sql out.hpp [options]
 //
 // Creates a scratch database on the server, runs schema.sql in it and writes,
-// per table, column tags, locators, a read shape `row` and a write shape
-// `write` (CONTEXT.md, 生成代码). Query files are prepared in the same database
-// and become typed functions (ADR 0008, 0009). --migrations builds a second
-// scratch database from a migrations directory and compares the two. Scratch
-// databases are always dropped.
+// per table, column tags, a read shape `row` and a write shape `write`
+// (CONTEXT.md, 生成代码). Query files are prepared in the same database and
+// become typed functions (ADR 0007, 0008, 0026). Every C++ type comes from the
+// type the server reports for a value, through libpg's codec table; a type
+// outside that table is an error. The scratch database is always dropped.
 
 #include <libpq-fe.h>
 
-#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
@@ -33,9 +33,7 @@ namespace {
 
 const char* const usage =
     "usage: pg_tablegen DSN schema.sql out.hpp [--namespace ns]\n"
-    "       [--override table.column=Type]... [--override-type pgtype=Type]...\n"
-    "       [--queries file.sql]... [--queries-out queries.hpp]\n"
-    "       [--migrations dir] [--check]\n";
+    "       [--queries file.sql]... [--queries-out queries.hpp] [--check]\n";
 
 struct usage_error : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -43,31 +41,10 @@ struct usage_error : std::runtime_error {
 
 struct options {
     std::string dsn, schema, out, ns = "db";
-    std::map<std::string, std::string> column_types;  // "table.column" -> C++ type
-    std::map<std::string, std::string> pg_types;      // PG type name -> C++ type
     std::vector<std::string> queries;
     std::string queries_out;
-    std::string migrations;
     bool check = false;
 };
-
-std::pair<std::string, std::string> split_assignment(const std::string& s, const std::string& flag) {
-    auto eq = s.find('=');
-    if (eq == 0 || eq == std::string::npos || eq + 1 == s.size())
-        throw usage_error(flag + " expects name=Type, got \"" + s + "\"");
-    return {s.substr(0, eq), s.substr(eq + 1)};
-}
-
-// Applies one option that takes a value.
-void set_option(options& o, const std::string& flag, const std::string& v) {
-    if (flag == "--namespace") o.ns = v;
-    else if (flag == "--override") o.column_types.insert(split_assignment(v, flag));
-    else if (flag == "--override-type") o.pg_types.insert(split_assignment(v, flag));
-    else if (flag == "--queries") o.queries.push_back(v);
-    else if (flag == "--queries-out") o.queries_out = v;
-    else if (flag == "--migrations") o.migrations = v;
-    else throw usage_error("unknown option " + flag);
-}
 
 // DSN schema.sql out.hpp, then options; a fourth positional argument is the namespace.
 options parse_args(int argc, char** argv) {
@@ -77,9 +54,14 @@ options parse_args(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--check") {
             o.check = true;
-        } else if (a.starts_with("--")) {
+        } else if (a == "--namespace" || a == "--queries" || a == "--queries-out") {
             if (i + 1 >= argc) throw usage_error(a + " needs a value");
-            set_option(o, a, argv[++i]);
+            std::string v = argv[++i];
+            if (a == "--namespace") o.ns = v;
+            else if (a == "--queries") o.queries.push_back(v);
+            else o.queries_out = v;
+        } else if (a.starts_with("--")) {
+            throw usage_error("unknown option " + a);
         } else {
             pos.push_back(a);
         }
@@ -92,8 +74,6 @@ options parse_args(int argc, char** argv) {
     if (!o.queries.empty() && o.queries_out.empty()) throw usage_error("--queries needs --queries-out");
     return o;
 }
-
-std::string read_file(const std::string& path);
 
 // ---------------------------------------------------------------- libpq RAII
 
@@ -120,13 +100,11 @@ result_ptr exec(PGconn* c, const std::string& sql, const std::string& what) {
     return checked(PQexec(c, sql.c_str()), c, what);
 }
 
-// Runs sql with text parameters.
-result_ptr exec_params(PGconn* c, const std::string& sql, const std::vector<std::string>& params,
-                       const std::string& what) {
-    std::vector<const char*> v;
-    for (const auto& p : params) v.push_back(p.c_str());
-    return checked(PQexecParams(c, sql.c_str(), static_cast<int>(v.size()), nullptr, v.data(), nullptr, nullptr, 0),
-                   c, what);
+// Prepares sql as the unnamed statement, its parameters typed by `types`, and
+// returns the server's description of it.
+result_ptr describe(PGconn* c, const std::string& sql, const std::string& what, const std::vector<Oid>& types = {}) {
+    checked(PQprepare(c, "", sql.c_str(), static_cast<int>(types.size()), types.data()), c, what);
+    return checked(PQdescribePrepared(c, ""), c, what);
 }
 
 std::string cell(const PGresult* r, int row, int col) { return PQgetvalue(r, row, col); }
@@ -152,12 +130,6 @@ const std::set<std::string>& cxx_keywords() {
     return k;
 }
 
-// Names a column's tag or shape member cannot take because the generated code
-// reserves them: the pg_ prefix and the row and write shape names.
-bool clashes_with_member(const std::string& s) {
-    return s.starts_with("pg_") || s == "row" || s == "write";
-}
-
 // A valid C++ identifier derived from a PG identifier.
 std::string sanitize(const std::string& s) {
     std::string out;
@@ -174,9 +146,11 @@ std::string table_ident(const std::string& s) {
     return cxx_keywords().count(id) ? id + "_" : id;
 }
 
+// A column's tag or shape member cannot take the pg_ prefix or the names of
+// the row and write shapes.
 std::string column_ident(const std::string& s) {
     auto id = table_ident(s);
-    return clashes_with_member(id) ? id + "_" : id;
+    return id.starts_with("pg_") || id == "row" || id == "write" ? id + "_" : id;
 }
 
 bool is_identifier(const std::string& s) { return !s.empty() && sanitize(s) == s; }
@@ -207,161 +181,48 @@ std::string escape_literal(const std::string& s) {
 
 std::string quote_literal(const std::string& s) { return "\"" + escape_literal(s) + "\""; }
 
-std::string quote_ident(const std::string& s) { return "\"" + s + "\""; }
-
 std::string join(const std::vector<std::string>& v, const std::string& sep) {
     std::string out;
     for (size_t i = 0; i < v.size(); ++i) out += (i ? sep : "") + v[i];
     return out;
 }
 
-// ------------------------------------------------------------ PG types
+// -------------------------------------------------------------------- types
 
-// A PG type with its domains resolved.
-struct pg_type {
-    std::vector<std::string> names;  // the type itself, then each domain's base down to the base type
-    char kind = 0;                   // pg_type.typtype of the base type
-    int typmod = -1;                 // the column's typmod, else the nearest domain's
-    bool not_null = false;           // some domain on the way says NOT NULL
-    const std::string& base() const { return names.back(); }
-};
-
-// Looks up types by OID, following domains to their base type.
-class type_catalog {
-public:
-    explicit type_catalog(PGconn* c) : c_(c) {}
-
-    pg_type resolve(Oid id, int typmod) {
-        pg_type t = chain(id);
-        if (typmod >= 0) t.typmod = typmod;
-        return t;
-    }
-
-private:
-    const pg_type& chain(Oid id) {
-        auto it = cache_.find(id);
-        if (it != cache_.end()) return it->second;
-        auto r = exec_params(c_,
-            "WITH RECURSIVE d(typname, typtype, typbasetype, typtypmod, typnotnull, depth) AS ("
-            "  SELECT typname::text, typtype, typbasetype, typtypmod, typnotnull, 0 "
-            "  FROM pg_catalog.pg_type WHERE oid = $1::oid "
-            "  UNION ALL "
-            "  SELECT t.typname::text, t.typtype, t.typbasetype, t.typtypmod, t.typnotnull, d.depth + 1 "
-            "  FROM d JOIN pg_catalog.pg_type t ON t.oid = d.typbasetype WHERE d.typtype = 'd') "
-            "SELECT typname, typtype, typtypmod, typnotnull FROM d ORDER BY depth",
-            {std::to_string(id)}, "read type " + std::to_string(id));
-        pg_type t;
-        for (int i = 0; i < PQntuples(r.get()); ++i) {
-            t.names.push_back(cell(r.get(), i, 0));
-            t.kind = cell(r.get(), i, 1)[0];
-            int mod = std::stoi(cell(r.get(), i, 2));
-            if (t.typmod < 0 && mod >= 0) t.typmod = mod;
-            t.not_null = t.not_null || cell(r.get(), i, 3) == "t";
-        }
-        if (t.names.empty()) throw std::runtime_error("unknown type OID " + std::to_string(id));
-        return cache_.emplace(id, std::move(t)).first->second;
-    }
-
-    PGconn* c_;
-    std::map<Oid, pg_type> cache_;
-};
-
-// NUMERIC(p, s) with p <= 18 and 0 <= s <= 18 is a fixed-point decimal; any
-// other numeric is arbitrary precision.
-std::string numeric_type(int typmod) {
-    if (typmod < 4) return "::pg::numeric";
-    int precision = ((typmod - 4) >> 16) & 0xffff;
-    int scale = (((typmod - 4) & 0x7ff) ^ 1024) - 1024;
-    if (precision > 18 || scale < 0 || scale > 18) return "::pg::numeric";
-    return "::pg::decimal<" + std::to_string(scale) + ">";
-}
-
-// The C++ type libpg's codecs give a PG base type, if any.
-std::optional<std::string> builtin_type(const pg_type& t) {
-    static const std::map<std::string, std::string> m = {
-        {"bool", "bool"},
-        {"int2", "std::int16_t"},
-        {"int4", "std::int32_t"},
-        {"int8", "std::int64_t"},
-        {"float4", "float"},
-        {"float8", "double"},
-        {"text", "std::string"},
-        {"varchar", "std::string"},
-        {"bpchar", "std::string"},
-        {"citext", "std::string"},
-        {"name", "std::string"},
-        {"bytea", "::pg::bytea"},
-        {"json", "::pg::jsonb"},
-        {"jsonb", "::pg::jsonb"},
-        {"timestamptz", "::pg::timestamptz"},
-        {"date", "::pg::date"},
-        {"uuid", "::pg::uuid"},
+// The C++ type libpg's codecs give a value the server reports as `type` with
+// `typmod`, or empty. NUMERIC(p, s) with p <= 18 and 0 <= s <= 18 is
+// pg::decimal<s>. The server reports a domain as its base type.
+std::string cxx_type(Oid type, int typmod) {
+    static const std::map<Oid, std::string> m = {
+        {16, "bool"}, {21, "std::int16_t"}, {23, "std::int32_t"}, {20, "std::int64_t"},
+        {700, "float"}, {701, "double"}, {25, "std::string"}, {1043, "std::string"},
+        {1042, "std::string"}, {19, "std::string"}, {3802, "::pg::jsonb"}, {2950, "::pg::uuid"},
+        {17, "::pg::bytea"}, {1184, "::pg::timestamptz"}, {1082, "::pg::date"},
     };
-    if (t.kind == 'e') return "std::string";
-    if (t.base() == "numeric") return numeric_type(t.typmod);
-    auto it = m.find(t.base());
-    if (it == m.end()) return std::nullopt;
-    return it->second;
+    if (type == 1700 && typmod >= 4) {
+        int precision = ((typmod - 4) >> 16) & 0xffff;
+        int scale = (((typmod - 4) & 0x7ff) ^ 1024) - 1024;
+        if (precision <= 18 && scale >= 0 && scale <= 18) return "::pg::decimal<" + std::to_string(scale) + ">";
+    }
+    auto it = m.find(type);
+    return it == m.end() ? "" : it->second;
 }
 
-// Picks the C++ type of a value: a column override, then a type override for
-// the type or any domain under it, then the builtin mapping. Records each
-// problem instead of stopping at the first.
-class type_mapper {
-public:
-    explicit type_mapper(const options& o) : o_(o) {}
-
-    // `column` is "table.column" when the value comes from a table column.
-    std::optional<std::string> map(const pg_type& t, const std::string& column) {
-        if (auto it = o_.column_types.find(column); it != o_.column_types.end()) {
-            used_.insert(column);
-            return it->second;
-        }
-        for (const auto& n : t.names)
-            if (auto it = o_.pg_types.find(n); it != o_.pg_types.end()) return it->second;
-        return builtin_type(t);
-    }
-
-    // Like map(), but an unmapped type is recorded as a problem of `where`.
-    std::string map_or_report(const pg_type& t, const std::string& column, const std::string& where) {
-        if (auto m = map(t, column)) return *m;
-        problems_.push_back(where + ": PG type " + describe(t) + " has no C++ mapping; " + advice(t, column));
-        return "void";
-    }
-
-    void report(std::string problem) { problems_.push_back(std::move(problem)); }
-
-    // Throws with every recorded problem, including column overrides that
-    // matched no column.
-    void throw_problems() {
-        for (const auto& [col, type] : o_.column_types)
-            if (!used_.count(col)) problems_.push_back("--override " + col + "=" + type + " matches no column");
-        if (problems_.empty()) return;
-        throw std::runtime_error(join(problems_, "\n"));
-    }
-
-private:
-    static std::string describe(const pg_type& t) {
-        return t.names.size() == 1 ? t.base() : t.names.front() + " (base type " + t.base() + ")";
-    }
-    static std::string advice(const pg_type& t, const std::string& column) {
-        std::string s;
-        if (!column.empty()) s += "pass --override " + column + "=Type or ";
-        return s + "--override-type " + t.base() + "=Type (Type needs a pg::codec), or cast it to ::text in SQL";
-    }
-
-    const options& o_;
-    std::set<std::string> used_;
-    std::vector<std::string> problems_;
-};
-
-// What reading a schema or query needs: the scratch connection, its types
-// and the type mapping.
+// The scratch connection, the NOT NULL table columns as (table OID, attnum),
+// and the problems found so far, which are reported together.
 struct session {
     PGconn* c;
-    type_catalog types;
-    type_mapper mapper;
-    session(PGconn* conn, const options& o) : c(conn), types(conn), mapper(o) {}
+    std::set<std::pair<Oid, int>> not_null;
+    std::vector<std::string> problems;
+
+    // The C++ type of a value; a type without one is a problem of `where`.
+    std::string map(Oid type, int typmod, const std::string& where) {
+        if (auto t = cxx_type(type, typmod); !t.empty()) return t;
+        auto r = exec(c, "SELECT format_type(" + std::to_string(type) + ", " + std::to_string(typmod) + ")",
+                      "format_type");
+        problems.push_back(where + ": PG type " + cell(r.get(), 0, 0) + " is not in libpg's codec table");
+        return "void";
+    }
 };
 
 // ------------------------------------------------------------------- tables
@@ -378,95 +239,62 @@ struct column {
 
 struct table {
     std::string name;
-    std::string schema;
-    std::vector<column> columns;                    // attnum order
-    std::vector<std::string> key;                   // primary key columns
-    std::vector<std::vector<std::string>> uniques;  // by constraint name
+    std::string relation;         // schema-qualified and quoted, for SQL
+    std::vector<column> columns;  // attnum order
+    std::vector<size_t> key;      // primary key columns (indexes into columns) in key order
 };
 
 using tables_t = std::map<std::string, table>;  // sorted by table name
 
-// Schemas that belong to the server, not to schema.sql.
-const char* const user_schemas_only =
-    "n.nspname NOT IN ('pg_catalog', 'information_schema') "
-    "AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp\\_%' ";
-
-char first_char(const std::string& s) { return s.empty() ? 0 : s[0]; }
-
-column read_column(session& s, const PGresult* r, int i, const std::string& table_name) {
-    column col;
-    col.name = cell(r, i, 1);
-    col.ident = column_ident(col.name);
-    auto type = s.types.resolve(static_cast<Oid>(std::stoul(cell(r, i, 2))), std::stoi(cell(r, i, 3)));
-    auto key = table_name + "." + col.name;
-    col.cxx = s.mapper.map_or_report(type, key, key);
-    col.nullable = !(cell(r, i, 4) == "t" || type.not_null);
-    col.has_default = cell(r, i, 5) == "t";
-    col.identity = first_char(cell(r, i, 6));
-    col.generated = first_char(cell(r, i, 7));
-    return col;
-}
-
-// Columns of every ordinary or partitioned (parent) table, in attnum order.
+// Columns of every ordinary or partitioned (parent) table outside the
+// server's own schemas, in attnum order, with each table's primary key. NOT
+// NULL columns are recorded in the session.
 void read_columns(session& s, tables_t& out) {
     auto r = exec(s.c,
-        std::string(
-        "SELECT cl.relname, a.attname, a.atttypid, a.atttypmod, a.attnotnull, a.atthasdef, "
-        "       a.attidentity, a.attgenerated, n.nspname "
+        "SELECT cl.relname, format('%I.%I', n.nspname, cl.relname), a.attname, a.attnotnull, a.atthasdef, "
+        "       a.attidentity, a.attgenerated, cl.oid, a.attnum, array_position(k.conkey, a.attnum) "
         "FROM pg_catalog.pg_class cl "
         "JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace "
         "JOIN pg_catalog.pg_attribute a ON a.attrelid = cl.oid AND a.attnum > 0 AND NOT a.attisdropped "
-        "WHERE cl.relkind IN ('r', 'p') AND NOT cl.relispartition AND ") + user_schemas_only +
+        "LEFT JOIN pg_catalog.pg_constraint k ON k.conrelid = cl.oid AND k.contype = 'p' "
+        "WHERE cl.relkind IN ('r', 'p') AND NOT cl.relispartition "
+        "  AND n.nspname NOT IN ('pg_catalog', 'information_schema') "
+        "  AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp\\_%' "
         "ORDER BY cl.relname COLLATE \"C\", a.attnum",
         "read columns");
     for (int i = 0; i < PQntuples(r.get()); ++i) {
         auto& t = out[cell(r.get(), i, 0)];
-        std::string schema = cell(r.get(), i, 8);
-        if (!t.schema.empty() && t.schema != schema)
-            throw std::runtime_error("table " + t.name + " is defined in both schema " + t.schema + " and " + schema);
+        auto relation = cell(r.get(), i, 1);
+        if (!t.relation.empty() && t.relation != relation)
+            throw std::runtime_error("table " + t.name + " is defined as both " + t.relation + " and " + relation);
         t.name = cell(r.get(), i, 0);
-        t.schema = schema;
-        t.columns.push_back(read_column(s, r.get(), i, t.name));
-    }
-}
-
-// One row per constraint column, in constraint-name then column-position order.
-void read_constraints(PGconn* c, tables_t& out) {
-    auto r = exec(c,
-        std::string(
-        "SELECT cl.relname, k.contype, a.attname, k.ord "
-        "FROM (SELECT con.conrelid, con.conname, con.contype, u.attnum, u.ord "
-        "      FROM pg_catalog.pg_constraint con, unnest(con.conkey) WITH ORDINALITY u(attnum, ord) "
-        "      WHERE con.contype IN ('p', 'u')) k "
-        "JOIN pg_catalog.pg_class cl ON cl.oid = k.conrelid "
-        "JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace "
-        "JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = k.attnum "
-        "WHERE cl.relkind IN ('r', 'p') AND NOT cl.relispartition AND ") + user_schemas_only +
-        "ORDER BY cl.relname COLLATE \"C\", k.conname COLLATE \"C\", k.ord",
-        "read constraints");
-    for (int i = 0; i < PQntuples(r.get()); ++i) {
-        auto& t = out.at(cell(r.get(), i, 0));
-        std::string name = cell(r.get(), i, 2);
-        if (cell(r.get(), i, 1) == "p") {
-            t.key.push_back(name);
-            continue;
+        t.relation = relation;
+        auto name = cell(r.get(), i, 2);
+        // An empty attidentity / attgenerated reads as '\0'.
+        t.columns.push_back({name, column_ident(name), {}, cell(r.get(), i, 3) != "t", cell(r.get(), i, 4) == "t",
+                             cell(r.get(), i, 5)[0], cell(r.get(), i, 6)[0]});
+        if (!t.columns.back().nullable)
+            s.not_null.emplace(std::stoul(cell(r.get(), i, 7)), std::stoi(cell(r.get(), i, 8)));
+        if (!PQgetisnull(r.get(), i, 9)) {
+            auto pos = std::stoul(cell(r.get(), i, 9));
+            if (t.key.size() < pos) t.key.resize(pos);
+            t.key[pos - 1] = t.columns.size() - 1;
         }
-        if (cell(r.get(), i, 3) == "1") t.uniques.emplace_back();
-        t.uniques.back().push_back(name);
     }
 }
 
+// Column types as the server describes `SELECT *` of each table.
 tables_t read_tables(session& s) {
     tables_t tables;
     read_columns(s, tables);
-    read_constraints(s.c, tables);
+    for (auto& [name, t] : tables) {
+        auto d = describe(s.c, "SELECT * FROM " + t.relation, "describe table " + name);
+        for (int i = 0; i < PQnfields(d.get()); ++i) {
+            auto& col = t.columns.at(i);
+            col.cxx = s.map(PQftype(d.get(), i), PQfmod(d.get(), i), name + "." + col.name);
+        }
+    }
     return tables;
-}
-
-const column& find_column(const table& t, const std::string& name) {
-    for (const auto& c : t.columns)
-        if (c.name == name) return c;
-    throw std::runtime_error("table " + t.name + ": no column " + name);
 }
 
 // ------------------------------------------------------------- shapes
@@ -506,7 +334,6 @@ std::string names_array(const std::string& member_name, const std::vector<std::s
 
 void emit_read_shape(std::ostream& o, const std::string& name, const std::vector<member>& ms) {
     std::vector<std::string> names;
-    names.reserve(ms.size());
     for (const auto& m : ms) names.push_back(m.column);
     o << "struct " << name << " {\n";
     emit_members(o, ms);
@@ -518,18 +345,18 @@ void emit_read_shape(std::ostream& o, const std::string& name, const std::vector
 
 // ------------------------------------------------------------ table output
 
-std::string key_types(const table& t, const std::vector<std::string>& cols) {
-    std::vector<std::string> types;
-    for (const auto& n : cols) types.push_back(find_column(t, n).cxx);
-    return "std::tuple<" + join(types, ", ") + ">";
-}
-
 void emit_table_struct(std::ostream& o, const table& t) {
     o << "struct table_ {\n"
       << "    static constexpr std::string_view name = " << quote_literal(t.name) << ";\n";
-    if (!t.key.empty())
-        o << "    using key = " << key_types(t, t.key) << ";\n"
-          << "    static constexpr " << names_array("key_columns", t.key) << ";\n";
+    if (!t.key.empty()) {
+        std::vector<std::string> types, names;
+        for (auto k : t.key) {
+            types.push_back(t.columns[k].cxx);
+            names.push_back(t.columns[k].name);
+        }
+        o << "    using key = std::tuple<" << join(types, ", ") << ">;\n"
+          << "    static constexpr " << names_array("key_columns", names) << ";\n";
+    }
     o << "};\n";
 }
 
@@ -538,23 +365,6 @@ void emit_column(std::ostream& o, const column& c) {
       << "    using pg_table = table_;\n"
       << "    using pg_type = " << optional_of(c.cxx, c.nullable) << ";\n"
       << "    static constexpr std::string_view pg_name = " << quote_literal(c.name) << ";\n};\n";
-}
-
-// Locator name for a unique constraint: by_a or by_a_and_b.
-std::string locator_name(const table& t, const std::vector<std::string>& cols) {
-    std::vector<std::string> ids;
-    for (const auto& n : cols) ids.push_back(sanitize(find_column(t, n).name));
-    return "by_" + join(ids, "_and_");
-}
-
-void emit_locator(std::ostream& o, const table& t, const std::vector<std::string>& cols) {
-    auto name = locator_name(t, cols);
-    o << "struct " << name << "_t {\n"
-      << "    using pg_table = table_;\n"
-      << "    using key = " << key_types(t, cols) << ";\n"
-      << "    static constexpr " << names_array("key_columns", cols) << ";\n"
-      << "};\n"
-      << "inline constexpr " << name << "_t " << name << "{};\n";
 }
 
 std::vector<member> read_members(const table& t) {
@@ -591,15 +401,9 @@ void emit_write_shape(std::ostream& o, const table& t) {
 // Every name declared in a table's namespace must be distinct.
 void check_names(const table& t) {
     std::set<std::string> seen = {"table_", "row", "write"};
-    auto add = [&](const std::string& n) {
-        if (!seen.insert(n).second)
-            throw std::runtime_error("table " + t.name + ": generated name " + n + " is used twice");
-    };
-    for (const auto& c : t.columns) add(c.ident);
-    for (const auto& u : t.uniques) {
-        add(locator_name(t, u));
-        add(locator_name(t, u) + "_t");
-    }
+    for (const auto& c : t.columns)
+        if (!seen.insert(c.ident).second)
+            throw std::runtime_error("table " + t.name + ": generated name " + c.ident + " is used twice");
 }
 
 void emit_namespace(std::ostream& o, const std::string& ns, const table& t) {
@@ -607,7 +411,6 @@ void emit_namespace(std::ostream& o, const std::string& ns, const table& t) {
     o << "\nnamespace " << ns << "::" << table_ident(t.name) << " {\n";
     emit_table_struct(o, t);
     for (const auto& c : t.columns) emit_column(o, c);
-    for (const auto& u : t.uniques) emit_locator(o, t, u);
     emit_read_shape(o, "row", read_members(t));
     emit_write_shape(o, t);
     o << "}\n";
@@ -647,8 +450,7 @@ struct query {
     std::string file;
     std::string name;
     result_kind kind = result_kind::many;
-    std::vector<std::string> params;  // names of $1..$n
-    std::string body;                 // SQL exactly as in the file, outer blank space trimmed
+    std::string body;  // SQL exactly as in the file, outer blank space trimmed
     std::string where() const { return file + ": query " + name; }
 };
 
@@ -657,15 +459,6 @@ std::string trim(const std::string& s) {
     if (b == std::string::npos) return {};
     auto e = s.find_last_not_of(" \t\r\n");
     return s.substr(b, e - b + 1);
-}
-
-std::vector<std::string> split_words(const std::string& s, char sep) {
-    std::vector<std::string> out;
-    std::string cur;
-    std::istringstream in(s);
-    while (std::getline(in, cur, sep))
-        if (auto w = trim(cur); !w.empty()) out.push_back(w);
-    return out;
 }
 
 result_kind parse_kind(const std::string& s, const std::string& where) {
@@ -678,14 +471,15 @@ result_kind parse_kind(const std::string& s, const std::string& where) {
 
 // `-- name: fn :kind`
 query parse_name_line(const std::string& file, const std::string& line) {
-    auto words = split_words(line.substr(8), ' ');
+    std::istringstream in(line.substr(8));
     query q;
     q.file = file;
-    if (words.size() != 2) throw std::runtime_error(file + ": expected \"-- name: fn :one|:opt|:many|:exec\", got \"" + trim(line) + "\"");
-    q.name = words[0];
+    std::string kind, extra;
+    if (!(in >> q.name >> kind) || in >> extra)
+        throw std::runtime_error(file + ": expected \"-- name: fn :one|:opt|:many|:exec\", got \"" + trim(line) + "\"");
     if (!is_identifier(q.name) || cxx_keywords().count(q.name))
         throw std::runtime_error(file + ": \"" + q.name + "\" is not a usable C++ function name");
-    q.kind = parse_kind(words[1], q.where());
+    q.kind = parse_kind(kind, q.where());
     return q;
 }
 
@@ -734,11 +528,11 @@ size_t quoted_end(const std::string& b, size_t start, char quote, bool backslash
 
 // End of a `--` or `/* */` comment or a `$tag$` string starting at i, else npos.
 size_t opaque_end(const std::string& b, size_t i) {
-    if (b[i] == '-' && i + 1 < b.size() && b[i + 1] == '-') {
+    if (b.compare(i, 2, "--") == 0) {
         auto nl = b.find('\n', i);
         return nl == std::string::npos ? b.size() : nl;
     }
-    if (b[i] == '/' && i + 1 < b.size() && b[i + 1] == '*') {
+    if (b.compare(i, 2, "/*") == 0) {
         auto end = b.find("*/", i + 2);
         return end == std::string::npos ? b.size() : end + 2;
     }
@@ -751,333 +545,161 @@ size_t opaque_end(const std::string& b, size_t i) {
     return end == std::string::npos ? b.size() : end + delim.size();
 }
 
-// Replaces :name and :'name' with $1..$n, numbering distinct names by first
-// appearance; strings, quoted identifiers, dollar quotes and comments are
-// copied untouched. Throws on bare $n and unusable names.
-std::string rewrite_placeholders(const query& q, std::vector<std::string>& names) {
+// A query body read for its two uses. `server` is what the scratch database
+// prepares: $1..$n for the distinct placeholder names (`params`, by first
+// appearance), holes left as comments. `format` is the pg::sql format string:
+// `{}` for every placeholder and hole occurrence, `args` naming what each one
+// receives, and every other brace doubled. `holes` are the distinct hole names.
+struct scanned {
+    std::string server, format;
+    std::vector<std::string> params, holes, args;
+    bool outer_join = false;  // LEFT, RIGHT or FULL JOIN outside literals and comments
+};
+
+// Reads :name and :'name' placeholders and /*@name*/ holes; strings, quoted
+// identifiers, dollar quotes and comments are copied untouched. Throws on a
+// bare $n and on unusable names.
+scanned scan(const query& q) {
     const std::string& b = q.body;
-    std::map<std::string, int> numbers;
-    std::string out;
-    out.reserve(b.size());
+    scanned s;
+    std::map<std::string, std::pair<bool, size_t>> seen;  // name -> (is a hole, $n)
+    std::string prev;                                     // the previous word, lower case
+    auto copy = [&](size_t from, size_t to) {
+        for (size_t k = from; k < to; ++k) {
+            s.server += b[k];
+            s.format += b[k];
+            if (b[k] == '{' || b[k] == '}') s.format += b[k];
+        }
+        return to;
+    };
+    auto use = [&](const std::string& name, bool hole) {
+        if (!is_identifier(name) || cxx_keywords().count(name))
+            throw std::runtime_error(q.where() + ": " + (hole ? "hole" : "placeholder") + " \"" + name +
+                                     "\" is not a usable C++ name");
+        auto& list = hole ? s.holes : s.params;
+        auto [it, fresh] = seen.try_emplace(name, hole, list.size() + 1);
+        if (it->second.first != hole) throw std::runtime_error(q.where() + ": \"" + name + "\" is both a placeholder and a hole");
+        if (fresh) list.push_back(name);
+        if (!hole) s.server += "$" + std::to_string(it->second.second);
+        s.format += "{}";
+        s.args.push_back(name);
+    };
     for (size_t i = 0; i < b.size();) {
-        char ch = b[i];
-        if (size_t e = opaque_end(b, i); e != std::string::npos) {
-            out.append(b, i, e - i);
-            i = e;
+        char ch = b[i], next = i + 1 < b.size() ? b[i + 1] : '\0';
+        if (b.compare(i, 3, "/*@") == 0) {
+            auto end = b.find("*/", i + 3);
+            if (end == std::string::npos) throw std::runtime_error(q.where() + ": a hole must be /*@name*/");
+            use(b.substr(i + 3, end - i - 3), true);
+            s.server.append(b, i, end + 2 - i);
+            i = end + 2;
+        } else if (size_t e = opaque_end(b, i); e != std::string::npos) {
+            i = copy(i, e);
         } else if (ch == '\'' || ch == '"') {
-            auto e = quoted_end(b, i + 1, ch, false);
-            out.append(b, i, e - i);
-            i = e;
-        } else if ((ch == 'E' || ch == 'e') && i + 1 < b.size() && b[i + 1] == '\'') {
-            auto e = quoted_end(b, i + 2, '\'', true);
-            out.append(b, i, e - i);
-            i = e;
-        } else if (ch == '$') {
-            if (i + 1 < b.size() && b[i + 1] >= '0' && b[i + 1] <= '9') {
-                size_t k = i + 2;
-                while (k < b.size() && b[k] >= '0' && b[k] <= '9') ++k;
-                throw std::runtime_error(q.where() + ": write :name instead of " + b.substr(i, k - i));
-            }
-            out += ch;
-            ++i;
-        } else if (ch == ':') {
-            if (i + 1 < b.size() && b[i + 1] == ':') {
-                out += "::";
-                i += 2;
-                continue;
-            }
-            size_t start, end, next;
-            if (i + 1 < b.size() && b[i + 1] == '\'') {
-                start = i + 2;
-                auto close = b.find('\'', start);
-                if (close == std::string::npos) throw std::runtime_error(q.where() + ": unterminated :'name' placeholder");
-                end = close;
-                next = close + 1;
-            } else if (i + 1 < b.size() && ident_start(b[i + 1])) {
-                start = i + 1;
-                end = start;
-                while (end < b.size() && ident_char(b[end])) ++end;
-                next = end;
-            } else {
-                out += ch;
-                ++i;
-                continue;
-            }
-            auto name = b.substr(start, end - start);
-            if (!is_identifier(name) || cxx_keywords().count(name))
-                throw std::runtime_error(q.where() + ": placeholder \"" + name + "\" is not a usable C++ name");
-            auto it = numbers.find(name);
-            if (it == numbers.end()) {
-                names.push_back(name);
-                it = numbers.emplace(name, static_cast<int>(names.size())).first;
-            }
-            out += "$" + std::to_string(it->second);
-            i = next;
+            i = copy(i, quoted_end(b, i + 1, ch, false));
+        } else if (ident_start(ch)) {
+            size_t k = i;
+            std::string word;
+            for (; k < b.size() && ident_char(b[k]); ++k) word += static_cast<char>(std::tolower(b[k]));
+            if (word == "e" && k < b.size() && b[k] == '\'') k = quoted_end(b, k + 1, '\'', true);
+            if ((prev == "left" || prev == "right" || prev == "full") && (word == "join" || word == "outer"))
+                s.outer_join = true;
+            prev = word;
+            i = copy(i, k);
+        } else if (ch == '$' && next >= '0' && next <= '9') {
+            auto end = b.find_first_not_of("0123456789", i + 1);
+            throw std::runtime_error(q.where() + ": write :name instead of " + b.substr(i, end - i));
+        } else if (ch == ':' && next == ':') {
+            i = copy(i, i + 2);
+        } else if (ch == ':' && next == '\'') {
+            auto close = b.find('\'', i + 2);
+            if (close == std::string::npos) throw std::runtime_error(q.where() + ": unterminated :'name' placeholder");
+            use(b.substr(i + 2, close - i - 2), false);
+            i = close + 1;
+        } else if (ch == ':' && ident_start(next)) {
+            size_t k = i + 1;
+            while (k < b.size() && ident_char(b[k])) ++k;
+            use(b.substr(i + 1, k - i - 1), false);
+            i = k;
         } else {
-            out += ch;
-            ++i;
+            i = copy(i, i + 1);
         }
     }
-    return out;
-}
-
-// The query body as a pg::sql format string: braces doubled and each hole
-// `/*@name*/` replaced by `{}`; `holes` receives the hole names in order.
-std::string format_body(const query& q, std::vector<std::string>& holes) {
-    std::string out;
-    for (size_t i = 0; i < q.body.size(); ++i) {
-        char ch = q.body[i];
-        if (q.body.compare(i, 3, "/*@") == 0) {
-            auto end = q.body.find("*/", i + 3);
-            auto name = end == std::string::npos ? "" : q.body.substr(i + 3, end - i - 3);
-            if (!is_identifier(name)) throw std::runtime_error(q.where() + ": a hole must be /*@name*/");
-            holes.push_back(name);
-            out += "{}";
-            i = end + 1;
-        } else {
-            out += ch;
-            if (ch == '{' || ch == '}') out += ch;
-        }
-    }
-    return out;
-}
-
-// --------------------------------------------------------- nullability
-
-std::string explain(PGconn* c, const query& q) {
-    auto r = exec(c, "EXPLAIN (VERBOSE, FORMAT JSON, GENERIC_PLAN) " + q.body, q.where() + ": EXPLAIN");
-    return cell(r.get(), 0, 0);
-}
-
-// Tables (and their partition roots) scanned on the nullable side of an outer
-// join anywhere in the plan, including inside CTEs referenced from there.
-std::set<Oid> nullable_relations(PGconn* c, const std::string& plan, const std::string& where) {
-    auto r = exec_params(c,
-        "WITH nodes AS ("
-        "  SELECT n FROM jsonb_path_query($1::jsonb, 'strict $.**') n WHERE jsonb_typeof(n) = 'object'), "
-        "sides AS ("
-        "  SELECT ch FROM nodes, jsonb_array_elements(n->'Plans') ch "
-        "  WHERE (n->>'Join Type' IN ('Left', 'Full') AND ch->>'Parent Relationship' = 'Inner') "
-        "     OR (n->>'Join Type' IN ('Right', 'Full') AND ch->>'Parent Relationship' = 'Outer')), "
-        "under AS ("
-        "  SELECT u FROM sides, jsonb_path_query(ch, 'strict $.**') u WHERE jsonb_typeof(u) = 'object'), "
-        "cte_under AS ("
-        "  SELECT u FROM nodes, jsonb_path_query(n, 'strict $.**') u "
-        "  WHERE jsonb_typeof(u) = 'object' "
-        "    AND n->>'Subplan Name' IN (SELECT 'CTE ' || (x->>'CTE Name') FROM under x(x))), "
-        "rels AS ("
-        "  SELECT format('%I.%I', u->>'Schema', u->>'Relation Name')::regclass::oid AS o "
-        "  FROM (SELECT u FROM under UNION ALL SELECT u FROM cte_under) x WHERE u ? 'Relation Name') "
-        "SELECT o FROM rels UNION SELECT pg_partition_root(o) FROM rels WHERE pg_partition_root(o) IS NOT NULL",
-        {plan}, where + ": read plan");
-    std::set<Oid> out;
-    for (int i = 0; i < PQntuples(r.get()); ++i) out.insert(static_cast<Oid>(std::stoul(cell(r.get(), i, 0))));
-    return out;
-}
-
-// What the plan says about rows that have no source: tables referenced by the
-// result but not scanned (a dummy Result replaced them, or every partition was
-// pruned), and whether any node computes grouping sets, whose super-aggregate
-// rows null the grouping columns.
-struct plan_gaps {
-    std::set<Oid> scanned;
-    bool grouping_sets = false;
-};
-
-plan_gaps read_plan_gaps(PGconn* c, const std::string& plan, const std::string& where) {
-    auto r = exec_params(c,
-        "WITH nodes AS ("
-        "  SELECT n FROM jsonb_path_query($1::jsonb, 'strict $.**') n WHERE jsonb_typeof(n) = 'object'), "
-        "rels AS ("
-        "  SELECT format('%I.%I', n->>'Schema', n->>'Relation Name')::regclass::oid AS o "
-        "  FROM nodes WHERE n ? 'Relation Name' AND n ? 'Schema') "
-        "SELECT 'g', 0 FROM nodes WHERE n ? 'Grouping Sets' OR n->>'Group Strategy' = 'Mixed' "
-        "UNION ALL SELECT 's', o FROM rels "
-        "UNION ALL SELECT 's', pg_partition_root(o) FROM rels WHERE pg_partition_root(o) IS NOT NULL",
-        {plan}, where + ": read plan");
-    plan_gaps out;
-    for (int i = 0; i < PQntuples(r.get()); ++i) {
-        if (cell(r.get(), i, 0) == "g") out.grouping_sets = true;
-        else out.scanned.insert(static_cast<Oid>(std::stoul(cell(r.get(), i, 1))));
-    }
-    return out;
-}
-
-// Result positions of a top-level INSERT/UPDATE/DELETE/MERGE whose RETURNING
-// entry is qualified by something other than the target or a scanned table:
-// `old.x` or `new.x`.
-std::set<int> returning_old_new(PGconn* c, const std::string& plan, const std::string& where) {
-    auto r = exec_params(c,
-        "WITH p AS (SELECT $1::jsonb -> 0 -> 'Plan' AS p), "
-        "aliases AS ("
-        "  SELECT quote_ident(n->>'Alias') AS a FROM p, jsonb_path_query(p, 'strict $.**') n "
-        "  WHERE jsonb_typeof(n) = 'object' AND n ? 'Relation Name') "
-        "SELECT i - 1 FROM p, jsonb_array_elements_text(p->'Output') WITH ORDINALITY o(e, i) "
-        "WHERE p->>'Node Type' = 'ModifyTable' "
-        "  AND substring(e from '^((?:\"(?:[^\"]|\"\")*\"|[[:alpha:]_][[:alnum:]_$]*))\\.') "
-        "      NOT IN (SELECT a FROM aliases)",
-        {plan}, where + ": read plan");
-    std::set<int> out;
-    for (int i = 0; i < PQntuples(r.get()); ++i) out.insert(std::stoi(cell(r.get(), i, 0)));
-    return out;
-}
-
-// The table column a result column comes from: "table.column" and whether it
-// is NOT NULL (by the column or its domain).
-struct origin {
-    std::string key;
-    bool not_null = false;
-};
-
-std::optional<origin> column_origin(session& s, Oid table_oid, int attnum) {
-    if (table_oid == InvalidOid || attnum <= 0) return std::nullopt;
-    auto r = exec_params(s.c,
-        "SELECT c.relname, a.attname, a.attnotnull, a.atttypid "
-        "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
-        "WHERE c.oid = $1::oid AND a.attnum = $2::int2",
-        {std::to_string(table_oid), std::to_string(attnum)}, "read column origin");
-    if (PQntuples(r.get()) != 1) return std::nullopt;
-    auto type = s.types.resolve(static_cast<Oid>(std::stoul(cell(r.get(), 0, 3))), -1);
-    return origin{cell(r.get(), 0, 0) + "." + cell(r.get(), 0, 1), cell(r.get(), 0, 2) == "t" || type.not_null};
-}
-
-// A result column as described by the server.
-struct result_column {
-    std::string label;            // as the server reports it
-    std::string name;             // without a `!` / `?` suffix
-    std::optional<bool> forced;   // nullable as the suffix says
-    std::optional<origin> from;   // table column it reads, if any
-    Oid table = InvalidOid;
-    pg_type type;
-};
-
-result_column describe_column(session& s, const PGresult* d, int i) {
-    result_column rc;
-    rc.label = PQfname(d, i);
-    rc.name = rc.label;
-    if (rc.name.size() > 1 && (rc.name.back() == '!' || rc.name.back() == '?')) {
-        rc.forced = rc.name.back() == '?';
-        rc.name.pop_back();
-    }
-    rc.table = PQftable(d, i);
-    rc.from = column_origin(s, rc.table, PQftablecol(d, i));
-    rc.type = s.types.resolve(PQftype(d, i), PQfmod(d, i));
-    return rc;
-}
-
-// Nullability per ADR 0009: non-null only for a NOT NULL table column that is
-// not on the nullable side of an outer join, not an unscanned table, not under
-// grouping sets and not a RETURNING old/new value.
-std::vector<bool> nullability(session& s, const query& q, const std::vector<result_column>& cols) {
-    bool need_plan = std::any_of(cols.begin(), cols.end(),
-                                 [](const auto& c) { return !c.forced && c.from && c.from->not_null; });
-    std::set<Oid> rels;
-    std::set<int> old_new;
-    plan_gaps gaps;
-    if (need_plan) {
-        auto plan = explain(s.c, q);
-        rels = nullable_relations(s.c, plan, q.where());
-        old_new = returning_old_new(s.c, plan, q.where());
-        gaps = read_plan_gaps(s.c, plan, q.where());
-    }
-    std::vector<bool> out;
-    for (size_t i = 0; i < cols.size(); ++i) {
-        const auto& c = cols[i];
-        bool not_null = c.from && c.from->not_null && !gaps.grouping_sets && gaps.scanned.count(c.table) &&
-                        !rels.count(c.table) && !old_new.count(static_cast<int>(i));
-        out.push_back(c.forced ? *c.forced : !not_null);
-    }
-    return out;
+    return s;
 }
 
 // ------------------------------------------------------------ query typing
 
 struct typed_query {
     query q;
-    std::vector<member> params;       // C++ parameter types
-    std::vector<std::string> holes;   // hole names, one per occurrence
-    std::vector<member> columns;      // read shape members
-    std::string format;               // pg::sql format text of the body
+    scanned s;
+    std::vector<member> params;   // one per distinct placeholder
+    std::vector<member> columns;  // read shape members
 };
 
-result_ptr prepare_and_describe(PGconn* c, const query& q) {
-    checked(PQprepare(c, "", q.body.c_str(), 0, nullptr), c, q.where());
-    return checked(PQdescribePrepared(c, ""), c, q.where() + ": describe");
-}
-
-std::vector<member> param_members(session& s, const query& q, const PGresult* d) {
-    int n = PQnparams(d);
-    if (static_cast<int>(q.params.size()) != n)
-        throw std::runtime_error(q.where() + ": SQL has " + std::to_string(n) + " parameter(s) but " +
-                                 std::to_string(q.params.size()) + " placeholder name(s)");
+// The placeholders' C++ types. The server may type a parameter as a domain,
+// so the types are read back as the result columns of `SELECT $1, ..., $n`,
+// which the server reports as base types.
+std::vector<member> param_members(session& s, const typed_query& t, const PGresult* d) {
+    std::vector<Oid> types;
+    std::vector<std::string> refs;
+    for (int i = 0; i < PQnparams(d); ++i) {
+        types.push_back(PQparamtype(d, i));
+        refs.push_back("$" + std::to_string(i + 1));
+    }
+    if (types.empty()) return {};
+    auto base = describe(s.c, "SELECT " + join(refs, ", "), t.q.where() + ": parameter types", types);
     std::vector<member> out;
-    for (int i = 0; i < n; ++i) {
-        auto where = q.where() + " parameter $" + std::to_string(i + 1) + " (" + q.params[i] + ")";
-        auto type = s.mapper.map_or_report(s.types.resolve(PQparamtype(d, i), -1), "", where);
-        out.push_back({q.params[i], type, {}});
+    for (int i = 0; i < PQnfields(base.get()); ++i) {
+        const auto& name = t.s.params.at(i);
+        auto where = t.q.file + ": " + t.q.name + " parameter :" + name;
+        out.push_back({name, s.map(PQftype(base.get(), i), PQfmod(base.get(), i), where), {}});
     }
     return out;
 }
 
-std::vector<member> column_members(session& s, const query& q, const PGresult* d) {
-    std::vector<result_column> cols;
-    for (int i = 0; i < PQnfields(d); ++i) cols.push_back(describe_column(s, d, i));
-    auto nullable = nullability(s, q, cols);
+// Result columns. A `!` or `?` suffix on the name makes the member plain or
+// optional; otherwise it is plain only for a NOT NULL table column in a query
+// with no outer join.
+std::vector<member> column_members(session& s, const typed_query& t, const PGresult* d) {
     std::vector<member> out;
-    for (size_t i = 0; i < cols.size(); ++i) {
-        const auto& c = cols[i];
-        auto where = q.where() + " column " + c.name;
-        if (c.name == "?column?") s.mapper.report(q.where() + ": result column " + std::to_string(i + 1) + " needs a name (AS ...)");
-        auto type = s.mapper.map_or_report(c.type, c.from ? c.from->key : "", where);
-        out.push_back({column_ident(c.name), optional_of(type, nullable[i]), c.label});
+    std::set<std::string> idents;
+    for (int i = 0; i < PQnfields(d); ++i) {
+        std::string label = PQfname(d, i), name = label;
+        std::optional<bool> nullable;
+        if (name.size() > 1 && (name.back() == '!' || name.back() == '?')) {
+            nullable = name.back() == '?';
+            name.pop_back();
+        }
+        if (label == "?column?")
+            s.problems.push_back(t.q.where() + ": result column " + std::to_string(i + 1) + " needs a name (AS ...)");
+        bool not_null = !t.s.outer_join && s.not_null.count({PQftable(d, i), PQftablecol(d, i)});
+        auto type = s.map(PQftype(d, i), PQfmod(d, i), t.q.file + ": " + t.q.name + "." + name);
+        out.push_back({column_ident(name), optional_of(type, nullable.value_or(!not_null)), label});
+        if (!idents.insert(out.back().ident).second)
+            throw std::runtime_error(t.q.where() + ": two result columns map to member " + out.back().ident + "; alias one");
     }
     return out;
-}
-
-// Parameter, hole and member names must each be distinct C++ names.
-void check_query_names(const typed_query& t) {
-    std::set<std::string> holes(t.holes.begin(), t.holes.end());
-    std::set<std::string> args;
-    for (const auto& p : t.params) {
-        if (!is_identifier(p.ident) || cxx_keywords().count(p.ident) || !args.insert(p.ident).second)
-            throw std::runtime_error(t.q.where() + ": parameter name \"" + p.ident + "\" is not a distinct C++ name");
-        if (holes.count(p.ident))
-            throw std::runtime_error(t.q.where() + ": parameter name \"" + p.ident + "\" clashes with a hole of the same name");
-    }
-    for (const auto& h : holes)
-        if (cxx_keywords().count(h) || !args.insert(h).second)
-            throw std::runtime_error(t.q.where() + ": hole name \"" + h + "\" is not a distinct C++ name");
-    std::set<std::string> members;
-    for (const auto& m : t.columns)
-        if (!members.insert(m.ident).second)
-            throw std::runtime_error(t.q.where() + ": two result columns map to member " + m.ident + "; alias one");
 }
 
 typed_query type_query(session& s, const query& q) {
-    if (PQserverVersion(s.c) < 160000)
-        throw std::runtime_error("query files need PostgreSQL 16 or newer (EXPLAIN GENERIC_PLAN)");
-    typed_query t;
-    t.q = q;
-    t.q.body = rewrite_placeholders(t.q, t.q.params);
-    t.format = format_body(t.q, t.holes);
-    auto d = prepare_and_describe(s.c, t.q);
-    t.params = param_members(s, t.q, d.get());
-    if (q.kind != result_kind::exec) t.columns = column_members(s, t.q, d.get());
-    if (q.kind != result_kind::exec && t.columns.empty())
-        throw std::runtime_error(q.where() + " returns no columns; annotate it :exec");
-    check_query_names(t);
+    typed_query t{q, scan(q), {}, {}};
+    auto d = describe(s.c, t.s.server, q.where());
+    t.params = param_members(s, t, d.get());
+    if (q.kind == result_kind::exec) return t;
+    t.columns = column_members(s, t, d.get());
+    if (t.columns.empty()) throw std::runtime_error(q.where() + " returns no columns; annotate it :exec");
     return t;
 }
+
+std::string read_file(const std::string& path);
 
 std::vector<typed_query> type_queries(session& s, const std::vector<std::string>& files) {
     std::vector<typed_query> out;
     std::set<std::string> names;
     for (const auto& f : files) {
-        auto display = std::filesystem::path(f).filename().string();
-        for (const auto& q : parse_query_file(display, read_file(f))) {
-            if (!names.insert(q.name).second || !names.insert(q.name + "_row").second ||
-                !names.insert(q.name + "_params").second)
-                throw std::runtime_error(q.where() + ": the name is used twice");
+        for (const auto& q : parse_query_file(std::filesystem::path(f).filename().string(), read_file(f))) {
+            for (const auto& n : {q.name, q.name + "_row", q.name + "_params"})
+                if (!names.insert(n).second) throw std::runtime_error(q.where() + ": the name is used twice");
             out.push_back(type_query(s, q));
         }
     }
@@ -1094,41 +716,21 @@ std::string param_decl(const member& p) {
     return "const " + p.type + "& " + p.ident;
 }
 
-// The type of a parameter inside the generated struct.
-std::string param_member_type(const member& p) {
-    return p.type == "std::string" ? "std::string_view" : p.type;
-}
-
-std::string return_type(const typed_query& t) {
+// The function's return type and the conn member that runs the statement.
+std::pair<std::string, std::string> result_of(const typed_query& t) {
     auto row = t.q.name + "_row";
     switch (t.q.kind) {
-    case result_kind::one: return row;
-    case result_kind::opt: return "std::optional<" + row + ">";
-    case result_kind::many: return "std::vector<" + row + ">";
-    case result_kind::exec: return "std::int64_t";
+    case result_kind::one: return {row, "conn.query_one<" + row + ">"};
+    case result_kind::opt: return {"std::optional<" + row + ">", "conn.query_opt<" + row + ">"};
+    case result_kind::many: return {"std::vector<" + row + ">", "conn.query<" + row + ">"};
+    case result_kind::exec: break;
     }
-    return {};
+    return {"std::int64_t", "conn.exec"};
 }
 
-std::string call(const typed_query& t) {
-    auto row = "<" + t.q.name + "_row>";
-    switch (t.q.kind) {
-    case result_kind::one: return "conn.query_one" + row;
-    case result_kind::opt: return "conn.query_opt" + row;
-    case result_kind::many: return "conn.query" + row;
-    case result_kind::exec: return "conn.exec";
-    }
-    return {};
-}
-
-// The statement's format string as adjacent literals, one per SQL line. A
-// leading comment holds one `{}` per parameter so they render as $1..$n.
-void emit_format(std::ostream& o, const typed_query& t) {
-    std::string text;
-    if (!t.params.empty()) text = "/*" + join(std::vector<std::string>(t.params.size(), "{}"), ",") + "*/";
-    text += t.format;
-    size_t start = 0;
-    while (start < text.size()) {
+// The format string as adjacent literals, one per SQL line.
+void emit_format(std::ostream& o, const std::string& text) {
+    for (size_t start = 0; start < text.size();) {
         auto nl = text.find('\n', start);
         auto end = nl == std::string::npos ? text.size() : nl + 1;
         o << "        " << quote_literal(text.substr(start, end - start)) << (end == text.size() ? "" : "\n");
@@ -1136,32 +738,27 @@ void emit_format(std::ostream& o, const typed_query& t) {
     }
 }
 
+// One input is a parameter of the function; two or more are the fields of
+// `<name>_params`.
 void emit_function(std::ostream& o, const typed_query& t) {
-    std::vector<std::string> holes;
-    std::set<std::string> seen;
-    for (const auto& h : t.holes)
-        if (seen.insert(h).second) holes.push_back(h);
-    bool packed = t.params.size() + holes.size() >= 2;
-
-    std::vector<std::string> decls = {"::pg::conn& conn"};
-    std::vector<std::string> args;
-    for (const auto& p : t.params) args.push_back(packed ? "p." + p.ident : p.ident);
-    for (const auto& h : t.holes) args.push_back(packed ? "p." + h : h);
-
+    bool packed = t.params.size() + t.s.holes.size() >= 2;
+    std::vector<std::string> decls = {"::pg::conn& conn"}, args;
+    for (const auto& a : t.s.args) args.push_back(packed ? "p." + a : a);
     if (packed) {
         o << "struct " << t.q.name << "_params {\n";
-        for (const auto& p : t.params) o << "    " << param_member_type(p) << " " << p.ident << ";\n";
-        for (const auto& h : holes) o << "    ::pg::sql " << h << ";\n";
+        for (const auto& p : t.params)
+            o << "    " << (p.type == "std::string" ? "std::string_view" : p.type) << " " << p.ident << ";\n";
+        for (const auto& h : t.s.holes) o << "    ::pg::sql " << h << ";\n";
         o << "};\n";
         decls.push_back("const " + t.q.name + "_params& p");
     } else {
         for (const auto& p : t.params) decls.push_back(param_decl(p));
-        for (const auto& h : holes) decls.push_back("const ::pg::sql& " + h);
+        for (const auto& h : t.s.holes) decls.push_back("const ::pg::sql& " + h);
     }
-
-    o << "inline " << return_type(t) << " " << t.q.name << "(" << join(decls, ", ") << ") {\n"
-      << "    return " << call(t) << "(::pg::sql{\n";
-    emit_format(o, t);
+    auto [type, call] = result_of(t);
+    o << "inline " << type << " " << t.q.name << "(" << join(decls, ", ") << ") {\n"
+      << "    return " << call << "(::pg::sql{\n";
+    emit_format(o, t.s.format);
     o << (args.empty() ? "" : ",\n        " + join(args, ", ")) << "});\n}\n";
 }
 
@@ -1174,9 +771,6 @@ std::string render_queries(const std::vector<typed_query>& qs, const std::string
       << "#include <array>\n#include <cstddef>\n#include <cstdint>\n#include <optional>\n#include <string>\n"
       << "#include <string_view>\n#include <vector>\n\n"
       << "#include \"pg/codec.hpp\"\n#include \"pg/pool.hpp\"\n#include \"pg/sql.hpp\"\n\n"
-      << "// Each statement starts with a comment holding its parameters, so they are\n"
-      << "// bound as $1..$n and the query body keeps its own $n references; holes are\n"
-      << "// spliced where the body has /*@name*/.\n\n"
       << "namespace " << ns << " {\n";
     for (const auto& t : qs) {
         o << "\n// " << t.q.where() << "\n";
@@ -1189,20 +783,18 @@ std::string render_queries(const std::vector<typed_query>& qs, const std::string
 
 // ------------------------------------------------------------ files
 
-std::string read_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error("cannot read " + path);
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
-
 std::optional<std::string> read_if_exists(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return std::nullopt;
     std::ostringstream ss;
     ss << in.rdbuf();
     return ss.str();
+}
+
+std::string read_file(const std::string& path) {
+    auto text = read_if_exists(path);
+    if (!text) throw std::runtime_error("cannot read " + path);
+    return *text;
 }
 
 void write_file(const std::string& path, const std::string& text) {
@@ -1231,12 +823,6 @@ int check_outputs(const std::vector<output>& outs) {
 
 // ------------------------------------------------------------ server
 
-PGconn* connect_or_throw(const char* const* keys, const char* const* values) {
-    conn_ptr c(PQconnectdbParams(keys, values, 0));
-    if (PQstatus(c.get()) != CONNECTION_OK) throw std::runtime_error(std::string("connect: ") + PQerrorMessage(c.get()));
-    return c.release();
-}
-
 // Connects with the DSN's own settings except for the database name; works
 // for both URI and key=value DSNs.
 conn_ptr connect_to(const std::string& dsn, const std::string& dbname) {
@@ -1247,22 +833,19 @@ conn_ptr connect_to(const std::string& dsn, const std::string& dbname) {
         PQfreemem(err);
         throw std::runtime_error("DSN: " + msg);
     }
-    std::vector<std::string> keys, values;
+    std::vector<const char*> k, v;
     for (auto* o = opts.get(); o->keyword; ++o) {
         if (!o->val || std::string(o->keyword) == "dbname") continue;
-        keys.push_back(o->keyword);
-        values.push_back(o->val);
+        k.push_back(o->keyword);
+        v.push_back(o->val);
     }
-    keys.push_back("dbname");
-    values.push_back(dbname);
-    std::vector<const char*> k, v;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        k.push_back(keys[i].c_str());
-        v.push_back(values[i].c_str());
-    }
+    k.push_back("dbname");
+    v.push_back(dbname.c_str());
     k.push_back(nullptr);
     v.push_back(nullptr);
-    return conn_ptr(connect_or_throw(k.data(), v.data()));
+    conn_ptr c(PQconnectdbParams(k.data(), v.data(), 0));
+    if (PQstatus(c.get()) != CONNECTION_OK) throw std::runtime_error(std::string("connect: ") + PQerrorMessage(c.get()));
+    return c;
 }
 
 // A database that exists for the lifetime of the object.
@@ -1271,12 +854,12 @@ public:
     explicit temp_database(PGconn* admin)
         : admin_(admin),
           name_("tablegen_" + std::to_string(getpid()) + "_" + std::to_string(std::random_device{}())) {
-        exec(admin_, "CREATE DATABASE " + quote_ident(name_) + " TEMPLATE template0", "create database");
+        exec(admin_, "CREATE DATABASE \"" + name_ + "\" TEMPLATE template0", "create database");
     }
     temp_database(const temp_database&) = delete;
     temp_database& operator=(const temp_database&) = delete;
     ~temp_database() {
-        std::string sql = "DROP DATABASE IF EXISTS " + quote_ident(name_) + " WITH (FORCE)";
+        std::string sql = "DROP DATABASE IF EXISTS \"" + name_ + "\" WITH (FORCE)";
         result_ptr r(PQexec(admin_, sql.c_str()));
         if (!r || PQresultStatus(r.get()) != PGRES_COMMAND_OK)
             std::cerr << "pg_tablegen: warning: cannot drop database " << name_ << "\n";
@@ -1302,82 +885,16 @@ private:
     conn_ptr conn_;
 };
 
-// ------------------------------------------------------------ drift
-
-// Every table column (position, type, nullability, default, identity,
-// generation) and every constraint except NOT NULL, one line each, outside the
-// libpg schema.
-std::set<std::string> catalog_lines(PGconn* c) {
-    auto r = exec(c,
-        std::string(
-        "SELECT format('%I.%I column %s %I %s%s%s%s%s', n.nspname, cl.relname, "
-        "  row_number() OVER (PARTITION BY cl.oid ORDER BY a.attnum), a.attname, "
-        "  format_type(a.atttypid, a.atttypmod), "
-        "  CASE WHEN a.attnotnull THEN ' not null' ELSE '' END, "
-        "  COALESCE(' default ' || pg_get_expr(d.adbin, d.adrelid), ''), "
-        "  CASE a.attidentity WHEN 'a' THEN ' identity always' WHEN 'd' THEN ' identity by default' ELSE '' END, "
-        "  CASE WHEN a.attgenerated <> '' THEN ' generated' ELSE '' END) "
-        "FROM pg_catalog.pg_class cl "
-        "JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace "
-        "JOIN pg_catalog.pg_attribute a ON a.attrelid = cl.oid AND a.attnum > 0 AND NOT a.attisdropped "
-        "LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
-        "WHERE cl.relkind IN ('r', 'p') AND n.nspname <> 'libpg' AND ") + user_schemas_only +
-        "UNION ALL "
-        "SELECT format('%I.%I constraint %s', n.nspname, cl.relname, pg_get_constraintdef(con.oid)) "
-        "FROM pg_catalog.pg_constraint con "
-        "JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid "
-        "JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace "
-        "WHERE con.contype <> 'n' AND n.nspname <> 'libpg' AND " + user_schemas_only,
-        "read catalog");
-    std::set<std::string> out;
-    for (int i = 0; i < PQntuples(r.get()); ++i) out.insert(cell(r.get(), i, 0));
-    return out;
-}
-
-std::vector<std::filesystem::path> migration_files(const std::string& dir) {
-    std::vector<std::filesystem::path> files;
-    for (const auto& e : std::filesystem::directory_iterator(dir))
-        if (e.is_regular_file() && e.path().extension() == ".sql") files.push_back(e.path());
-    std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.filename() < b.filename(); });
-    if (files.empty()) throw std::runtime_error("no .sql files in " + dir);
-    return files;
-}
-
-std::set<std::string> migrated_catalog(PGconn* admin, const options& o) {
-    scratch db(admin, o.dsn);
-    for (const auto& f : migration_files(o.migrations))
-        exec(db.c(), read_file(f.string()), "migration " + f.filename().string());
-    return catalog_lines(db.c());
-}
-
-std::vector<std::string> only_in(const std::set<std::string>& a, const std::set<std::string>& b) {
-    std::vector<std::string> out;
-    std::set_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(out));
-    return out;
-}
-
-// Throws when the migrations build a different schema than schema.sql.
-void check_drift(PGconn* admin, const options& o, const std::set<std::string>& schema) {
-    auto migrated = migrated_catalog(admin, o);
-    auto missing = only_in(schema, migrated), extra = only_in(migrated, schema);
-    if (missing.empty() && extra.empty()) return;
-    std::string msg = "schema drift between " + o.schema + " and " + o.migrations;
-    for (const auto& l : missing) msg += "\n  only in schema.sql: " + l;
-    for (const auto& l : extra) msg += "\n  only in migrations: " + l;
-    throw std::runtime_error(msg);
-}
-
 // ------------------------------------------------------------------ main
 
 int run(const options& o) {
     auto admin = connect_to(o.dsn, "postgres");
     scratch db(admin.get(), o.dsn);
     exec(db.c(), read_file(o.schema), "schema.sql");
-    session s(db.c(), o);
+    session s{db.c(), {}, {}};
     auto tables = read_tables(s);
     auto queries = type_queries(s, o.queries);
-    s.mapper.throw_problems();
-    if (!o.migrations.empty()) check_drift(admin.get(), o, catalog_lines(db.c()));
+    if (!s.problems.empty()) throw std::runtime_error(join(s.problems, "\n"));
     std::vector<output> outs{{o.out, render_tables(tables, o.ns, std::filesystem::path(o.schema).filename().string())}};
     if (!o.queries_out.empty()) outs.push_back({o.queries_out, render_queries(queries, o.ns, o.queries)});
     if (o.check) return check_outputs(outs);

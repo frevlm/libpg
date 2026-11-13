@@ -13,10 +13,6 @@
 #include "pg/pool.hpp"
 #include "pg/sql.hpp"
 
-// Each statement starts with a comment holding its parameters, so they are
-// bound as $1..$n and the query body keeps its own $n references; holes are
-// spliced where the body has /*@name*/.
-
 namespace db {
 
 // fixture.sql: query user_by_id
@@ -47,9 +43,9 @@ struct user_by_id_row {
 };
 inline user_by_id_row user_by_id(::pg::conn& conn, std::int32_t id) {
     return conn.query_one<user_by_id_row>(::pg::sql{
-        "/*{}*/SELECT id, username, email, balance, stake, profile, uid, mood, joined\n"
+        "SELECT id, username, email, balance, stake, profile, uid, mood, joined\n"
         "FROM users\n"
-        "WHERE id = $1;",
+        "WHERE id = {};",
         id});
 }
 
@@ -67,14 +63,14 @@ struct user_by_name_row {
 };
 inline std::optional<user_by_name_row> user_by_name(::pg::conn& conn, std::string_view username) {
     return conn.query_opt<user_by_name_row>(::pg::sql{
-        "/*{}*/SELECT id, username AS \"login?\" FROM users WHERE username = $1;",
+        "SELECT id, username AS \"login?\" FROM users WHERE username = {};",
         username});
 }
 
 // fixture.sql: query group_members
 struct group_members_row {
-    std::int32_t user_id{};
-    std::string role{};
+    std::optional<std::int32_t> user_id{};
+    std::optional<std::string> role{};
     std::optional<std::string> username{};
     std::optional<std::string> title{};
     static constexpr std::size_t pg_columns = 4;
@@ -93,11 +89,11 @@ struct group_members_params {
 };
 inline std::vector<group_members_row> group_members(::pg::conn& conn, const group_members_params& p) {
     return conn.query<group_members_row>(::pg::sql{
-        "/*{}*/SELECT m.user_id, m.role, u.username, g.title\n"
+        "SELECT m.user_id, m.role, u.username, g.title\n"
         "FROM memberships m\n"
         "LEFT JOIN users u ON u.id = m.user_id\n"
         "LEFT JOIN groups g ON g.id = m.group_id\n"
-        "WHERE m.group_id = $1 {}\n"
+        "WHERE m.group_id = {} {}\n"
         "ORDER BY m.user_id;",
         p.group_id, p.filter});
 }
@@ -133,9 +129,9 @@ struct users_with_profile_row {
 };
 inline std::vector<users_with_profile_row> users_with_profile(::pg::conn& conn, const ::pg::jsonb& wanted) {
     return conn.query<users_with_profile_row>(::pg::sql{
-        "/*{}*/SELECT id, profile\n"
+        "SELECT id, profile\n"
         "FROM users\n"
-        "WHERE profile @> $1::jsonb OR profile @> '{{\"vip\": true}}'\n"
+        "WHERE profile @> {}::jsonb OR profile @> '{{\"vip\": true}}'\n"
         "ORDER BY id;",
         wanted});
 }
@@ -147,14 +143,14 @@ struct set_active_params {
 };
 inline std::int64_t set_active(::pg::conn& conn, const set_active_params& p) {
     return conn.exec(::pg::sql{
-        "/*{},{}*/UPDATE users SET active = $1 WHERE id = $2;",
+        "UPDATE users SET active = {} WHERE id = {};",
         p.active, p.id});
 }
 
 // fixture.sql: query add_points
 struct add_points_row {
-    std::optional<std::int64_t> before{};
-    std::optional<std::int64_t> after{};
+    std::int64_t before{};
+    std::int64_t after{};
     std::int64_t points{};
     static constexpr std::size_t pg_columns = 3;
     static constexpr std::array<std::string_view, 3> pg_names{"before", "after", "points"};
@@ -171,7 +167,7 @@ struct add_points_params {
 };
 inline add_points_row add_points(::pg::conn& conn, const add_points_params& p) {
     return conn.query_one<add_points_row>(::pg::sql{
-        "/*{},{}*/UPDATE users SET points = points + $1 WHERE id = $2\n"
+        "UPDATE users SET points = points + {} WHERE id = {}\n"
         "RETURNING old.points AS before, new.points AS after, points;",
         p.delta, p.id});
 }
@@ -181,7 +177,7 @@ struct rollup_totals_row {
     std::optional<std::int32_t> group_id{};
     std::optional<std::int64_t> n{};
     static constexpr std::size_t pg_columns = 2;
-    static constexpr std::array<std::string_view, 2> pg_names{"group_id", "n"};
+    static constexpr std::array<std::string_view, 2> pg_names{"group_id?", "n"};
     template <class F>
     void pg_each(F&& f) {
         f(group_id);
@@ -190,12 +186,12 @@ struct rollup_totals_row {
 };
 inline std::vector<rollup_totals_row> rollup_totals(::pg::conn& conn) {
     return conn.query<rollup_totals_row>(::pg::sql{
-        "SELECT group_id, count(*) AS n FROM memberships GROUP BY ROLLUP (group_id) ORDER BY group_id;"});
+        "SELECT group_id AS \"group_id?\", count(*) AS n FROM memberships GROUP BY ROLLUP (group_id) ORDER BY group_id;"});
 }
 
 // fixture.sql: query left_join_false
 struct left_join_false_row {
-    std::int32_t user_id{};
+    std::optional<std::int32_t> user_id{};
     std::optional<std::int16_t> group_id{};
     static constexpr std::size_t pg_columns = 2;
     static constexpr std::array<std::string_view, 2> pg_names{"user_id", "group_id"};
@@ -212,7 +208,7 @@ inline std::vector<left_join_false_row> left_join_false(::pg::conn& conn) {
 
 // fixture.sql: query left_join_pruned
 struct left_join_pruned_row {
-    std::int32_t user_id{};
+    std::optional<std::int32_t> user_id{};
     std::optional<std::int32_t> measurement_id{};
     static constexpr std::size_t pg_columns = 2;
     static constexpr std::array<std::string_view, 2> pg_names{"user_id", "measurement_id"};
@@ -248,7 +244,7 @@ struct add_group_params {
 };
 inline add_group_row add_group(::pg::conn& conn, const add_group_params& p) {
     return conn.query_one<add_group_row>(::pg::sql{
-        "/*{},{}*/INSERT INTO groups (id, title) VALUES ($1, $2) RETURNING id, title;",
+        "INSERT INTO groups (id, title) VALUES ({}, {}) RETURNING id, title;",
         p.id, p.title});
 }
 

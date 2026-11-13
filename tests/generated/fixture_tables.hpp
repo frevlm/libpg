@@ -232,12 +232,6 @@ struct since {
     using pg_type = std::optional<::pg::timestamptz>;
     static constexpr std::string_view pg_name = "since";
 };
-struct by_user_id_and_role_t {
-    using pg_table = table_;
-    using key = std::tuple<std::int32_t, std::string>;
-    static constexpr std::array<std::string_view, 2> key_columns{"user_id", "role"};
-};
-inline constexpr by_user_id_and_role_t by_user_id_and_role{};
 struct row {
     std::int32_t user_id{};
     std::int32_t group_id{};
@@ -283,7 +277,7 @@ struct id {
 };
 struct limit_ {
     using pg_table = table_;
-    using pg_type = std::int32_t;
+    using pg_type = std::optional<std::int32_t>;
     static constexpr std::string_view pg_name = "limit_";
 };
 struct soft {
@@ -298,7 +292,7 @@ struct cost {
 };
 struct row {
     std::int32_t id{};
-    std::int32_t limit_{};
+    std::optional<std::int32_t> limit_{};
     std::int32_t soft{};
     std::optional<::pg::decimal<2>> cost{};
     static constexpr std::size_t pg_columns = 4;
@@ -314,7 +308,7 @@ struct row {
 struct write {
     using pg_table = table_;
     std::int32_t id{};
-    std::int32_t limit_{};
+    std::optional<std::int32_t> limit_{};
     std::int32_t soft{};
     std::optional<::pg::decimal<2>> cost{};
     static constexpr std::array<std::string_view, 4> pg_names{"id", "limit_", "soft", "cost"};
@@ -384,11 +378,6 @@ struct profile {
     using pg_type = ::pg::jsonb;
     static constexpr std::string_view pg_name = "profile";
 };
-struct raw {
-    using pg_table = table_;
-    using pg_type = std::optional<::pg::jsonb>;
-    static constexpr std::string_view pg_name = "raw";
-};
 struct joined {
     using pg_table = table_;
     using pg_type = ::pg::timestamptz;
@@ -403,11 +392,6 @@ struct ratio {
     using pg_table = table_;
     using pg_type = std::optional<float>;
     static constexpr std::string_view pg_name = "ratio";
-};
-struct ip {
-    using pg_table = table_;
-    using pg_type = std::optional<std::string>;
-    static constexpr std::string_view pg_name = "ip";
 };
 struct uid {
     using pg_table = table_;
@@ -424,11 +408,6 @@ struct stake {
     using pg_type = ::pg::decimal<6>;
     static constexpr std::string_view pg_name = "stake";
 };
-struct big {
-    using pg_table = table_;
-    using pg_type = std::optional<::pg::numeric>;
-    static constexpr std::string_view pg_name = "big";
-};
 struct mood {
     using pg_table = table_;
     using pg_type = std::optional<std::string>;
@@ -439,12 +418,6 @@ struct level {
     using pg_type = std::optional<std::int32_t>;
     static constexpr std::string_view pg_name = "level";
 };
-struct by_username_t {
-    using pg_table = table_;
-    using key = std::tuple<std::string>;
-    static constexpr std::array<std::string_view, 1> key_columns{"username"};
-};
-inline constexpr by_username_t by_username{};
 struct row {
     std::int32_t id{};
     std::string username{};
@@ -456,19 +429,16 @@ struct row {
     std::optional<double> score{};
     ::pg::decimal<2> balance{};
     ::pg::jsonb profile{};
-    std::optional<::pg::jsonb> raw{};
     ::pg::timestamptz joined{};
     std::optional<::pg::date> birthday{};
     std::optional<float> ratio{};
-    std::optional<std::string> ip{};
     ::pg::uuid uid{};
     std::optional<::pg::bytea> avatar{};
     ::pg::decimal<6> stake{};
-    std::optional<::pg::numeric> big{};
     std::optional<std::string> mood{};
     std::optional<std::int32_t> level{};
-    static constexpr std::size_t pg_columns = 21;
-    static constexpr std::array<std::string_view, 21> pg_names{"id", "username", "email", "nick", "active", "rank", "points", "score", "balance", "profile", "raw", "joined", "birthday", "ratio", "ip", "uid", "avatar", "stake", "big", "mood", "level"};
+    static constexpr std::size_t pg_columns = 18;
+    static constexpr std::array<std::string_view, 18> pg_names{"id", "username", "email", "nick", "active", "rank", "points", "score", "balance", "profile", "joined", "birthday", "ratio", "uid", "avatar", "stake", "mood", "level"};
     template <class F>
     void pg_each(F&& f) {
         f(id);
@@ -481,15 +451,12 @@ struct row {
         f(score);
         f(balance);
         f(profile);
-        f(raw);
         f(joined);
         f(birthday);
         f(ratio);
-        f(ip);
         f(uid);
         f(avatar);
         f(stake);
-        f(big);
         f(mood);
         f(level);
     }
@@ -505,17 +472,14 @@ struct write {
     std::optional<double> score{};
     ::pg::field<::pg::decimal<2>> balance{};
     ::pg::field<::pg::jsonb> profile{};
-    std::optional<::pg::jsonb> raw{};
     ::pg::field<::pg::timestamptz> joined{};
     std::optional<::pg::date> birthday{};
     std::optional<float> ratio{};
-    std::optional<std::string> ip{};
     ::pg::field<::pg::uuid> uid{};
     std::optional<::pg::bytea> avatar{};
     ::pg::field<::pg::decimal<6>> stake{};
-    std::optional<::pg::numeric> big{};
     std::optional<std::string> mood{};
-    static constexpr std::array<std::string_view, 19> pg_names{"username", "email", "nick", "active", "rank", "points", "score", "balance", "profile", "raw", "joined", "birthday", "ratio", "ip", "uid", "avatar", "stake", "big", "mood"};
+    static constexpr std::array<std::string_view, 16> pg_names{"username", "email", "nick", "active", "rank", "points", "score", "balance", "profile", "joined", "birthday", "ratio", "uid", "avatar", "stake", "mood"};
     template <class F>
     void pg_each(F&& f) const {
         f(username);
@@ -527,15 +491,12 @@ struct write {
         f(score);
         f(balance);
         f(profile);
-        f(raw);
         f(joined);
         f(birthday);
         f(ratio);
-        f(ip);
         f(uid);
         f(avatar);
         f(stake);
-        f(big);
         f(mood);
     }
 };

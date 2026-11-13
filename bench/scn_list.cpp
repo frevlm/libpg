@@ -38,6 +38,8 @@ struct submission_row {
     bool accepted{};
     pg::jsonb content{};
     static constexpr std::size_t pg_columns = 10;
+    static constexpr std::array<std::string_view, 10> pg_names{
+        "id", "user_id", "problem_id", "submitter", "title", "note", "score", "submit_time", "accepted", "content"};
     template <class F>
     void pg_each(F&& f) {
         f(id);
@@ -125,7 +127,6 @@ void run_v2(const Cfg& cfg, const char* name, bool list) {
             note(std::string(name) + " pool=" + std::to_string(size) + " threads=" + std::to_string(t));
             pg::pool_options o;
             o.dsn = cfg.dsn;
-            o.pooler = cfg.pooler;
             o.max_conns = size;
             pg::pool p(o);
             emit(name, t, size, run_point(t, cfg.duration, [&](Ctx& x) {
@@ -163,7 +164,6 @@ void run_v2_get_row_slow(const Cfg& cfg) {
             note("v2_get_row_slow pool=" + std::to_string(size) + " threads=" + std::to_string(t));
             pg::pool_options o;
             o.dsn = cfg.dsn;
-            o.pooler = cfg.pooler;
             o.max_conns = size;
             pg::pool p(o);
             emit("v2_get_row_slow", t - 1, size, run_point(t, cfg.duration, [&](Ctx& x) {

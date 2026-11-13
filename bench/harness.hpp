@@ -157,7 +157,6 @@ struct Cfg {
     std::vector<int> pools{8, 16, 32};
     std::vector<int> pc_threads{8, 16, 32, 64, 128};
     std::vector<int> pc_pools{4, 8, 16, 32};
-    bool pooler = false;  // the DSN is a transaction pooler (pool_options::pooler)
 };
 
 using Worker = std::function<void(Ctx&)>;
@@ -178,8 +177,9 @@ struct Scenario {
     void (*run)(const Cfg&);
 };
 void register_raw(std::vector<Scenario>&);
-void register_v1(std::vector<Scenario>&);
+void register_pool(std::vector<Scenario>&);
 void register_v2(std::vector<Scenario>&);
+void register_wb(std::vector<Scenario>&);  // defined only when pg_writeback is built (BENCH_WRITEBACK)
 void register_list(std::vector<Scenario>&);
 void register_real(std::vector<Scenario>&);
 

@@ -1,13 +1,14 @@
 # libpg
 
-PostgreSQL 的 C++20 客户端库，直接基于 libpq：连接池、参数化 SQL、带类型的结果、事务，
-把数据库格子当变量用的 `pg::cell<Col>`、写回缓存 `pg::writeback`、批量插入 `pg::insert_all`。
+PostgreSQL 的 C++20 客户端库，直接基于 libpq：连接池、参数化 SQL、严格对齐的二进制类型、事务、
+`conn::send` 先发后取、写回缓存 `pg::writeback`、批量插入 `pg::insert_all`、迁移 `pg::migrate`，
+以及从 schema 和查询文件生成类型的 `pg_tablegen`。
 怎么用见 [docs/usage.md](docs/usage.md)，术语见 [CONTEXT.md](CONTEXT.md)，设计决定见 [docs/adr/](docs/adr/)。
 
 ## 依赖
 
-- CMake ≥ 3.25，C++20 编译器，标准库要支持浮点 `std::from_chars`（GCC ≥ 11；macOS 需 Xcode ≥ 26 或 LLVM ≥ 20）
-- libpq ≥ 14（≥ 17 时使用新的 pipeline 接口）
+- CMake ≥ 3.25，C++20 编译器
+- libpq ≥ 14（pipeline 模式）
 - 测试：Catch2 3、PostgreSQL 服务端程序（`initdb`/`pg_ctl`）
 
 ## 构建与测试
@@ -28,7 +29,16 @@ FetchContent_MakeAvailable(libpg)
 target_link_libraries(app PRIVATE pg)
 ```
 
+链接 `pg` 得到核心；写回缓存在单独的库里，需要时再链接 `pg_writeback` 并 `#include <pg/writeback.hpp>`。
 作为子项目引入时默认不构建测试。
+
+```cpp
+#include <pg/pg.hpp>
+
+pg::pool p({.dsn = "postgresql://app@db/app"});
+pg::conn c(p);
+auto name = c.query_opt<std::string>(pg::sql{"SELECT username FROM users WHERE id = {}", 7});
+```
 
 ## 许可证
 

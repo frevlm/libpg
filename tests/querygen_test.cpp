@@ -20,16 +20,20 @@
 static_assert(pg::read_shape<db::users::row>);
 static_assert(pg::write_shape<db::users::write>);
 static_assert(pg::read_shape<db::group_members_row>);
-static_assert(db::users::row::pg_columns == 21);
+// users.id (identity always) and users.level (generated) are read, not written.
+static_assert(db::users::write::pg_names.size() == db::users::row::pg_columns - 2);
 template <class T, class Member>
 constexpr bool member_is = std::is_same_v<T, Member>;
+// A NOT NULL table column is plain unless the query has an outer join; a ? alias makes it optional.
+static_assert(member_is<decltype(db::user_by_id_row::id), std::int32_t>);
+static_assert(member_is<decltype(db::user_by_id_row::email), std::optional<std::string>>);
 static_assert(member_is<decltype(db::rollup_totals_row::group_id), std::optional<std::int32_t>>);
 static_assert(member_is<decltype(db::left_join_false_row::group_id), std::optional<std::int16_t>>);
-static_assert(member_is<decltype(db::left_join_false_row::user_id), std::int32_t>);
+static_assert(member_is<decltype(db::left_join_false_row::user_id), std::optional<std::int32_t>>);
 static_assert(member_is<decltype(db::left_join_pruned_row::measurement_id), std::optional<std::int32_t>>);
 static_assert(member_is<decltype(db::add_group_row::id), std::int16_t>);
 static_assert(member_is<decltype(db::add_group_row::title), std::string>);
-static_assert(db::users::write::pg_names.size() == 19);
+static_assert(member_is<decltype(db::add_points_row::before), std::int64_t>);
 
 namespace {
 
@@ -135,7 +139,7 @@ TEST_CASE(":many with a hole: empty hole, and a hole whose parameter follows $1"
     CHECK(admins[0].username == std::optional<std::string>("ann"));
 }
 
-TEST_CASE("a NOT NULL column on the nullable side of a LEFT JOIN reads NULL") {
+TEST_CASE("a NOT NULL column in a query with a LEFT JOIN is optional and reads NULL") {
     pg::conn c(test_pool());
     seed(c);
     auto rows = db::group_members(c, {.group_id = 2, .filter = pg::sql{}});
@@ -166,12 +170,12 @@ TEST_CASE(":exec returns affected rows; parameters bind by name, not by position
     CHECK(db::set_active(c, {.active = true, .id = ann + 1000}) == 0);
 }
 
-TEST_CASE("RETURNING old and new values are optional, the plain column is not") {
+TEST_CASE("UPDATE RETURNING old and new values of a NOT NULL column are plain") {
     pg::conn c(test_pool());
     auto ann = seed(c);
     db::add_points_row r = db::add_points(c, {.delta = 5, .id = ann});
-    CHECK(r.before == std::optional<std::int64_t>(0));
-    CHECK(r.after == std::optional<std::int64_t>(5));
+    CHECK(r.before == 0);
+    CHECK(r.after == 5);
     CHECK(r.points == 5);
 }
 
@@ -218,7 +222,7 @@ TEST_CASE("a table's read shape decodes SELECT *") {
     CHECK(r.since == std::nullopt);
 }
 
-TEST_CASE("columns with no source row read as NULL") {
+TEST_CASE("a ROLLUP column aliased ? and outer-joined columns read NULL") {
     pg::conn c(test_pool());
     seed(c);
     auto totals = db::rollup_totals(c);

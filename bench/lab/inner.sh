@@ -23,10 +23,10 @@ fleet)
   # server or through PgBouncer (transaction mode, 16 server connections).
   delay=$1 pods=$2 via=$3; shift 3
   [ "$delay" = 0 ] || tc qdisc add dev eth0 root netem delay "${delay}us"
-  dsn=$DSN extra=
-  [ "$via" = bouncer ] && dsn=postgresql://postgres@libpg-lab-bouncer:6432/bench extra=--pooler
+  dsn=$DSN
+  [ "$via" = bouncer ] && dsn=postgresql://postgres@libpg-lab-bouncer:6432/bench
   for i in $(seq "$pods"); do
-    "$bin" --dsn "$dsn" $extra "$@" 2>/dev/null | sed "s/^/$i,/" &
+    "$bin" --dsn "$dsn" "$@" 2>/dev/null | sed "s/^/$i,/" &
   done
   wait ;;
 cgwin)

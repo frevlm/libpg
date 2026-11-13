@@ -39,10 +39,19 @@ function(libpg_test name)
   set_tests_properties(${name} PROPERTIES FIXTURES_REQUIRED pg ENVIRONMENT "LIBPG_TEST_DSN=${LIBPG_TEST_DSN}")
 endfunction()
 
+libpg_test(codec_test)
+libpg_test(statement_test)
+libpg_test(query_test)
+libpg_test(pool_test)
+libpg_test(transaction_test)
+libpg_test(migrate_test)
+libpg_test(writeback_test)
+target_link_libraries(writeback_test PRIVATE pg_writeback)
+
 # pg_tablegen: the generator reproduces the checked-in headers, and what it
 # writes for the real projects' schemas compiles.
 set(LIBPG_TABLEGEN_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/tablegen_compile.cmake)
-set(LIBPG_FIXTURE_ARGS "--override|users.ip=std::string|--queries|${CMAKE_CURRENT_SOURCE_DIR}/queries/fixture.sql")
+set(LIBPG_FIXTURE_ARGS "--queries|${CMAKE_CURRENT_SOURCE_DIR}/queries/fixture.sql")
 add_test(NAME tablegen_fixture COMMAND ${CMAKE_COMMAND}
   -DTABLEGEN=$<TARGET_FILE:pg_tablegen> -DDSN=${LIBPG_TEST_DSN}
   -DSCHEMA=${CMAKE_CURRENT_SOURCE_DIR}/fixture_schema.sql
@@ -73,21 +82,8 @@ foreach(project revlm HHHOJ)
 endforeach()
 set_tests_properties(${tablegen_tests} PROPERTIES FIXTURES_REQUIRED pg RESOURCE_LOCK tablegen)
 
-libpg_test(codec_test)
-libpg_test(statement_test)
-libpg_test(query_test)
-libpg_test(pool_test)
-libpg_test(transaction_test)
-libpg_test(migrate_test)
-libpg_test(cell_test)
-libpg_test(writeback_test)
-libpg_test(sharded_test)
-libpg_test(pooler_test)
-libpg_test(prefetch_test)
-set_tests_properties(pooler_test PROPERTIES SKIP_RETURN_CODE 4)
-
 # pg_tablegen exit codes: --check on the checked-in headers, --check on a stale
-# copy, --migrations with and without drift, and a column with no C++ type.
+# copy, and a type outside the codec table.
 function(tablegen_expect_test name rc args)
   add_test(NAME ${name} COMMAND ${CMAKE_COMMAND}
     -DTABLEGEN=$<TARGET_FILE:pg_tablegen> -DDSN=${LIBPG_TEST_DSN} -DPSQL=${LIBPG_PG_BINDIR}/psql
@@ -104,9 +100,6 @@ tablegen_expect_test(tablegen_check 0
 tablegen_expect_test(tablegen_check_stale 1
   "${fixture_schema}|${stale_tables}|${LIBPG_FIXTURE_ARGS}|--queries-out|${fixture_queries}|--check"
   -DSTALE_FROM=${fixture_tables} -DSTALE_TO=${stale_tables} "-DEXPECT_MESSAGE=fixture_tables.hpp is out of date")
-tablegen_expect_test(tablegen_unmapped 1
-  "${fixture_schema}|${CMAKE_CURRENT_BINARY_DIR}/tablegen_unmapped/out.hpp"
-  "-DEXPECT_MESSAGE=users\\.ip: PG type inet has no C\\+\\+ mapping; pass --override users\\.ip=Type")
 # A CRLF copy of the fixture query file generates the same header.
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/queries/fixture.sql fixture_queries_lf)
 string(REPLACE "\n" "\r\n" fixture_queries_crlf "${fixture_queries_lf}")
@@ -114,29 +107,27 @@ set(crlf_queries ${CMAKE_CURRENT_BINARY_DIR}/crlf/fixture.sql)
 file(WRITE ${crlf_queries} "${fixture_queries_crlf}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/queries/fixture.sql)
 tablegen_expect_test(tablegen_crlf_queries 0
-  "${fixture_schema}|${fixture_tables}|--override|users.ip=std::string|--queries|${crlf_queries}|--queries-out|${fixture_queries}|--check")
-set(drift_dir ${CMAKE_CURRENT_SOURCE_DIR}/drift)
-tablegen_expect_test(tablegen_migrations_match 0
-  "${drift_dir}/schema.sql|${CMAKE_CURRENT_BINARY_DIR}/tablegen_drift/match.hpp|--migrations|${drift_dir}/match")
-tablegen_expect_test(tablegen_migrations_drift 1
-  "${drift_dir}/schema.sql|${CMAKE_CURRENT_BINARY_DIR}/tablegen_drift/mismatch.hpp|--migrations|${drift_dir}/mismatch"
-  "-DEXPECT_MESSAGE=only in migrations: public\\.transfers column 4 note text not null")
+  "${fixture_schema}|${fixture_tables}|--queries|${crlf_queries}|--queries-out|${fixture_queries}|--check")
 
 # Named placeholders: repeated names, casts after a placeholder, colons in
-# literals and comments, and the rejected -- params: and bare $1 forms.
+# literals and comments, the rejected -- params: and bare $1 forms, and a type
+# outside the codec table.
 set(placeholder_queries ${CMAKE_CURRENT_SOURCE_DIR}/queries)
 set(placeholder_out ${CMAKE_CURRENT_BINARY_DIR}/tablegen_placeholders)
+tablegen_expect_test(tablegen_unmapped 1
+  "${fixture_schema}|${placeholder_out}/unmapped.hpp|--queries|${placeholder_queries}/unmapped_type.sql|--queries-out|${placeholder_out}/unmapped_queries.hpp"
+  "-DEXPECT_MESSAGE=unmapped_type\\.sql: unmapped_type\\.addr: PG type inet is not in libpg's codec table")
 tablegen_expect_test(tablegen_repeated_placeholder 0
-  "${fixture_schema}|${placeholder_out}/repeated.hpp|--override|users.ip=std::string|--queries|${placeholder_queries}/repeated_placeholder.sql|--queries-out|${placeholder_out}/repeated_queries.hpp")
+  "${fixture_schema}|${placeholder_out}/repeated.hpp|--queries|${placeholder_queries}/repeated_placeholder.sql|--queries-out|${placeholder_out}/repeated_queries.hpp")
 tablegen_expect_test(tablegen_cast_placeholder 0
-  "${fixture_schema}|${placeholder_out}/cast.hpp|--override|users.ip=std::string|--queries|${placeholder_queries}/cast_placeholder.sql|--queries-out|${placeholder_out}/cast_queries.hpp")
+  "${fixture_schema}|${placeholder_out}/cast.hpp|--queries|${placeholder_queries}/cast_placeholder.sql|--queries-out|${placeholder_out}/cast_queries.hpp")
 tablegen_expect_test(tablegen_ignored_placeholders 0
-  "${fixture_schema}|${placeholder_out}/ignored.hpp|--override|users.ip=std::string|--queries|${placeholder_queries}/ignored_placeholders.sql|--queries-out|${placeholder_out}/ignored_queries.hpp")
+  "${fixture_schema}|${placeholder_out}/ignored.hpp|--queries|${placeholder_queries}/ignored_placeholders.sql|--queries-out|${placeholder_out}/ignored_queries.hpp")
 tablegen_expect_test(tablegen_params_line 1
-  "${fixture_schema}|${placeholder_out}/params_line.hpp|--override|users.ip=std::string|--queries|${placeholder_queries}/params_line.sql|--queries-out|${placeholder_out}/params_line_queries.hpp"
+  "${fixture_schema}|${placeholder_out}/params_line.hpp|--queries|${placeholder_queries}/params_line.sql|--queries-out|${placeholder_out}/params_line_queries.hpp"
   "-DEXPECT_MESSAGE=use :name placeholders instead of -- params:")
 tablegen_expect_test(tablegen_bare_dollar 1
-  "${fixture_schema}|${placeholder_out}/bare_dollar.hpp|--override|users.ip=std::string|--queries|${placeholder_queries}/bare_dollar.sql|--queries-out|${placeholder_out}/bare_dollar_queries.hpp"
+  "${fixture_schema}|${placeholder_out}/bare_dollar.hpp|--queries|${placeholder_queries}/bare_dollar.sql|--queries-out|${placeholder_out}/bare_dollar_queries.hpp"
   "-DEXPECT_MESSAGE=write :name instead of")
 
 # Generated query functions run against a database built from fixture_schema.sql.
