@@ -243,7 +243,7 @@ std::int64_t copy_on(conn& c, std::string_view table, std::span<const copy_colum
         std::size_t k = 0;
         while (k < cols.size() && cols[k].accepts(types[k])) ++k;
         if (k == cols.size()) break;
-        if (fresh) throw error(error_kind::other, "insert_all: " + column_error(k, std::string(cols[k].name), types[k], cols[k].type));
+        if (fresh) throw error(error_kind::data, "insert_all: " + column_error(k, std::string(cols[k].name), types[k], cols[k].type));
     }
     const std::string text = sql{"COPY {} ({}) FROM STDIN (FORMAT binary)", ident(table), names}.render().text;
     wire& w = c.quiet();
@@ -530,7 +530,7 @@ detail::wire& conn::quiet() {
         std::lock_guard lk(w.mu);
         queue(w, "", [](PGconn*) { return 1; });
     }
-    detail::drain(w);
+    if (auto e = detail::drain(w)) throw *e;  // what follows would only fail on the aborted transaction
     if (w.broken) throw error(error_kind::broken, "the connection was lost");
     if (!PQexitPipelineMode(w.c) || PQsetnonblocking(w.c, 0) != 0) throw error(error_kind::other, detail::message(w.c));
     return w;

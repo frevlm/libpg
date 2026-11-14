@@ -54,6 +54,7 @@ struct copy_column {
     std::string_view name;
     bool (*accepts)(oid);
     std::string_view type;
+    bool operator==(const copy_column&) const = default;
 };
 // Checks the types of table's columns `cols` (as the server describes SELECT
 // "a", "b" FROM "t"), then runs COPY "t" ("a", "b") FROM STDIN (FORMAT binary)
@@ -61,7 +62,7 @@ struct copy_column {
 std::int64_t copy_on(conn& c, std::string_view table, std::span<const copy_column> cols, const std::string& data);
 
 template <class T>
-std::string_view type_name() {
+constexpr std::string_view type_name() {
     std::string_view p = __PRETTY_FUNCTION__;
     p.remove_prefix(p.find("T = ") + 4);
     return p.substr(0, p.find_first_of(";]"));

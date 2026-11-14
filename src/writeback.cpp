@@ -1,5 +1,6 @@
 #include "pg/writeback.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -18,10 +19,9 @@ constexpr std::string_view kReceipt = "INSERT INTO libpg.flush_receipts";
 constexpr std::size_t kBatchMax = 10'000;  // postings in one transaction
 constexpr int kSplitAfter = 3;             // lock or conflict failures before a batch is halved
 
-std::string pack_param(std::string out, const param& p) {
-    put_be(p.type, 4, out);
-    put_be(p.bytes->size(), 4, out);
-    return out + *p.bytes;
+void pack_param(std::string& out, const param& p) {
+    put_be(std::uint64_t{p.type} << 32 | p.bytes->size(), 8, out);  // the type OID, then the length
+    out += *p.bytes;
 }
 
 struct slot {
@@ -29,18 +29,10 @@ struct slot {
     std::int64_t committed = 0, pending = 0;  // database value as last read; unsettled deltas
     int unsettled = 0;                        // deltas recorded and not settled
     bool loaded = false, read = false;        // committed is a database value; read since it was loaded
-    clock::time_point read_at, loaded_at;
+    clock::time_point loaded_at;
 };
 
 struct shard { std::mutex mu; std::unordered_map<std::string, slot> map; };
-
-void add_param(array_builder& b, const param& p) {
-    b.element = p.type;
-    ++b.count;
-    b.nulls |= !p.bytes;
-    put_be(p.bytes ? p.bytes->size() : 0xffffffff, 4, b.body);
-    if (p.bytes) b.body += *p.bytes;
-}
 
 // The array parameters of columns, then the extra ones.
 sql arrays_sql(const std::vector<array_builder>& bs, const std::vector<array_builder>& extra = {}) {
@@ -88,8 +80,9 @@ struct wb_state {
     std::mutex mu;            // guards what follows
     std::condition_variable wake, done;
     std::vector<posting> queue;
-    std::uint64_t reserved = 0, submitted = 0, settled = 0, committed = 0, lost = 0, replays = 0;
+    std::uint64_t submitted = 0, settled = 0, committed = 0, lost = 0, replays = 0;
     bool kick = false;
+    std::atomic<std::size_t> backlog{0};  // postings recorded and not settled
     std::atomic<bool> stop{false};
     std::atomic<int> fault{0};
     std::thread writer;
@@ -116,38 +109,33 @@ struct wb_state {
     std::int64_t value(const counter& d, const std::string& k) {
         { conn probe(p); }  // a thread holding a conn of the pool fails here, hot key or cold
         shard& sh = shard_of(k);
-        const auto now = clock::now();
         {
             std::lock_guard lk(sh.mu);
-            if (auto it = sh.map.find(k); it != sh.map.end() && it->second.loaded) {
-                it->second.read = true, it->second.read_at = now;
-                return it->second.committed + it->second.pending;
-            }
+            if (auto it = sh.map.find(k); it != sh.map.end() && it->second.loaded)
+                return it->second.read = true, it->second.committed + it->second.pending;
         }
         std::shared_lock rd(db_mu);  // no batch settles between the SELECT and the slot
         const units_rows rows = load(d, std::span<const std::string>(&k, 1));
         if (rows.empty()) throw not_found("writeback: no row of " + std::string(d.table) + " for the key");
         std::lock_guard lk(sh.mu);
         slot& s = sh.map[k];
-        s = {&d, std::get<1>(rows[0]), s.pending, s.unsettled, true, true, now, now};
+        s = {&d, std::get<1>(rows[0]), s.pending, s.unsettled, true, false, clock::now()};
         return s.committed + s.pending;
     }
 
     void submit(posting po) {
-        {
-            std::lock_guard lk(mu);
-            if (reserved - settled >= o.backlog_limit) throw backlog_full("writeback: backlog limit reached");
-            ++reserved;
+        if (backlog.fetch_add(1) >= o.backlog_limit) {
+            backlog.fetch_sub(1);
+            throw backlog_full("writeback: backlog limit reached");
         }
-        const auto now = clock::now();
         for (const wb_delta& d : po.deltas_) {
-            std::lock_guard lk(shard_of(d.key).mu);
-            slot& s = shard_of(d.key).map.try_emplace(d.key, slot{d.def, 0, 0, 0, false, false, now, now}).first->second;
-            s.pending += d.units, ++s.unsettled;
+            shard& sh = shard_of(d.key);
+            std::lock_guard lk(sh.mu);
+            slot& s = sh.map[d.key];
+            s.def = d.def, s.pending += d.units, ++s.unsettled;
         }
         std::lock_guard lk(mu);
-        queue.push_back(std::move(po));
-        ++submitted;
+        queue.push_back(std::move(po)), ++submitted;
     }
 
     // Waits until everything submitted before the call is settled, or the deadline.
@@ -159,8 +147,9 @@ struct wb_state {
         done.wait_until(lk, deadline, [&] { return settled >= target; });
     }
 
-    // Drops the slots nobody reads and nothing is unsettled on; re-reads, one
-    // statement per counter, the loaded slots read since they were loaded and older than `refresh`.
+    // Of the slots loaded longer than `refresh` ago, drops those nobody read since
+    // and nothing is unsettled on, and re-reads the rest that were read, one
+    // statement per counter; drops the unloaded slots nothing is unsettled on.
     void refresh() {
         const auto now = clock::now();
         // A receipt only has to outlive the replays of its batch; once an hour, drop those older than a day.
@@ -173,8 +162,9 @@ struct wb_state {
             std::lock_guard lk(sh.mu);
             for (auto it = sh.map.begin(); it != sh.map.end();) {
                 const slot& s = it->second;
-                if (s.unsettled == 0 && now - s.read_at > o.refresh) it = sh.map.erase(it);
-                else if (s.read && s.loaded && now - s.loaded_at > o.refresh) due[s.def].push_back((it++)->first);
+                const bool old = now - s.loaded_at > o.refresh;
+                if (s.unsettled == 0 && (!s.loaded || (old && !s.read))) it = sh.map.erase(it);
+                else if (old && s.read) due[s.def].push_back((it++)->first);
                 else ++it;
             }
         }
@@ -186,31 +176,26 @@ struct wb_state {
             }
     }
 
-    // One transaction: the receipt, one INSERT per (table, column set), one UPDATE per counter.
+    // One transaction: the receipt, one binary COPY per (table, columns), one UPDATE per counter.
     void transact_batch(std::span<posting> ps, const uuid& receipt) {
-        std::map<std::string, std::pair<const wb_row*, std::vector<array_builder>>> inserts;
+        std::vector<std::pair<const wb_row*, std::string>> copies;  // a row of the group, the group's COPY stream
         std::map<const counter*, std::map<std::string, std::int64_t>> sums;  // one delta per key
         for (const posting& po : ps) {
             for (const wb_row& r : po.rows_) {
-                std::string id(r.table);
-                for (std::size_t i = 0; i < r.columns.size(); ++i) id += '\0' + std::string(r.columns[i]) + ':' + std::to_string(r.values[i].type);
-                auto& [first, arrays] = inserts[id];
-                if (!first) first = &r, arrays.resize(r.columns.size());
-                for (std::size_t i = 0; i < r.values.size(); ++i) add_param(arrays[i], r.values[i]);
+                auto g = std::ranges::find_if(copies, [&](const auto& g) { return g.first->table == r.table && g.first->columns == r.columns; });
+                if (g == copies.end()) g = copies.insert(g, {&r, std::string("PGCOPY\n\377\r\n\0\0\0\0\0\0\0\0\0", 19)});
+                put_be(r.values.size(), 2, g->second);
+                for (const param& v : r.values) put_be(v.bytes ? v.bytes->size() : 0xffffffff, 4, g->second), g->second += v.bytes ? std::string_view(*v.bytes) : "";
             }
             for (const wb_delta& d : po.deltas_) sums[d.def][d.key] += d.units;
         }
         conn c(p);
         transaction tx(c);
         std::vector<pending<>> sent;
-        std::vector<std::int64_t> expect;  // rows each statement must touch, -1: any
+        std::vector<std::int64_t> expect;  // rows each statement must touch
         auto send = [&](const sql& q, std::int64_t rows) { sent.push_back(c.send<>(q)), expect.push_back(rows); };
         send(sql{"INSERT INTO libpg.flush_receipts (id) VALUES ({})", receipt}, 1);
-        for (auto& [id, g] : inserts) {
-            std::vector<sql> cols;
-            for (std::string_view name : g.first->columns) cols.push_back(ident(name));
-            send(sql{"INSERT INTO {} ({}) SELECT * FROM unnest({})", ident(g.first->table), join(cols, sql{", "}), arrays_sql(g.second)}, -1);
-        }
+        for (auto& [r, data] : copies) put_be(0xffff, 2, data), copy_on(c, r->table, r->columns, data);  // a replay fails on the receipt first
         for (const auto& [d, by_key] : sums) {
             std::vector<std::string> keys;
             array_builder deltas;
@@ -222,7 +207,7 @@ struct wb_state {
                  static_cast<std::int64_t>(keys.size()));
         }
         for (std::size_t i = 0; i < sent.size(); ++i)
-            if (const std::int64_t n = sent[i].affected(); expect[i] >= 0 && n != expect[i]) throw error(error_kind::data, "writeback: a counter's row does not exist");
+            if (sent[i].affected() != expect[i]) throw error(error_kind::data, "writeback: a counter's row does not exist");
         tx.commit();
     }
 
@@ -293,6 +278,7 @@ struct wb_state {
         std::lock_guard lk(mu);
         (e ? lost : committed) += ps.size();
         settled += ps.size();
+        backlog -= ps.size();
         done.notify_all();
     }
 
@@ -310,17 +296,16 @@ struct wb_state {
         while (!stop) {
             wake.wait_for(lk, o.interval, [&] { return stop || kick; });
             if (stop) return;
-            const auto n = static_cast<std::ptrdiff_t>(std::min(queue.size(), kBatchMax));
-            std::vector<posting> batch(std::make_move_iterator(queue.begin()), std::make_move_iterator(queue.begin() + n));
-            queue.erase(queue.begin(), queue.begin() + n);
-            kick = !queue.empty();
+            kick = false;
+            std::vector<posting> batch;
+            batch.swap(queue);
             lk.unlock();
             try {
                 std::unique_lock w(db_mu);
                 refresh();
             } catch (const error&) {  // a failed refresh is tried again next interval
             }
-            if (!batch.empty()) write(batch);
+            for (std::size_t i = 0; i < batch.size(); i += kBatchMax) write(std::span(batch).subspan(i, std::min(kBatchMax, batch.size() - i)));
             lk.lock();
         }
     }
@@ -346,7 +331,7 @@ void writeback::flush() { st_->flush(detail::clock::now() + std::chrono::hours(2
 
 writeback_stats writeback::stats() const {
     std::lock_guard lk(st_->mu);
-    return {static_cast<std::size_t>(st_->reserved - st_->settled), st_->committed, st_->lost, st_->replays};
+    return {st_->backlog.load(), st_->committed, st_->lost, st_->replays};
 }
 
 }  // namespace pg

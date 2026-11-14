@@ -13,4 +13,4 @@
 - 事务外的语句共用线路连接（0020）。
 - `conn::raw()` 返回的 `PGconn*` 已读完所有在途语句、退出 pipeline 模式并恢复阻塞，可以直接调用 PQexec；
   这条线路连接归这个 `conn` 独占，`conn` 结束时关闭，不再回池。迁移用它执行多语句脚本。
-- `insert_all` 的 COPY 同样先读完在途语句、退出 pipeline 模式，结束后下一条语句再把连接放回非阻塞的 pipeline 模式。
+- `insert_all` 的 COPY 同样先读完在途语句（其中有失败的就抛它的错，不在已中止的事务里再发 COPY）、退出 pipeline 模式，结束后下一条语句再把连接放回非阻塞的 pipeline 模式。

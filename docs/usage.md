@@ -83,7 +83,8 @@ wb.submit(pg::posting{}.insert(ev).add<db::users::balance>(-cost, user_id));
 - 一笔 `pg::posting` 里的插入行和增量一起提交，或者一起放弃。`posting{}.insert(row)` 和 `.add<Col>(delta, key...)` 可以链式调用。
 - 后台线程把积压的笔写成一个事务，开头插一条回执。断线或提交结果未知时原样重放，回执冲突说明已经提交过，
   所以不会重复扣款（[ADR 0012](adr/0012-idempotent-write-back-via-receipts.md)）。
-- 同一张表、同一组列的插入行在一批里合成一条 `INSERT ... SELECT FROM unnest(...)`，每个计数器一条 `UPDATE ... FROM unnest(...)`。
+- 同一张表、同一组列的插入行在一批里合成一条二进制 COPY，每个计数器一条 `UPDATE ... FROM unnest(...)`。
+  插入行的成员类型和 `insert_all` 一样按列严格核对，对不上的那一笔交给 `on_lost`。
 - 数据错误（行不存在、约束）把批次对半拆开，直到找出出错的那一笔，交给 `on_lost`，它的增量从内存撤回。
 - 内存值靠 `refresh` 定期重读保持新鲜，没有跨副本通知（[ADR 0028](adr/0028-writeback-freshness-by-reread.md)）：
   别的副本或手工 SQL 的改动，最多滞后约 `refresh` 加一个 `interval` 才反映到 `get`。

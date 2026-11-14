@@ -513,7 +513,7 @@ TEST_CASE("insert_all with a member type unlike its column throws before inserti
     c.exec(sql{"DROP TABLE IF EXISTS insert_all_wide"});
     c.exec(sql{"CREATE TABLE insert_all_wide (id bigint)"});
     const pg::error e = error_of([&] { pg::insert_all(c, std::vector<typed_write<insert_wide_>>{{1}, {2}}); });
-    REQUIRE(e.kind == pg::error_kind::other);
+    REQUIRE(e.kind == pg::error_kind::data);
     REQUIRE(std::string(e.what()).starts_with("insert_all: column 1 \"id\" has type OID 20"));
     REQUIRE(c.query_one<std::int64_t>(sql{"SELECT count(*) FROM insert_all_wide"}) == 0);
 }

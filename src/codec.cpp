@@ -53,10 +53,6 @@ constexpr std::int64_t pg_epoch_us = pg_epoch_days * 86'400'000'000;
 
 namespace detail {
 
-void put_be(std::uint64_t v, std::size_t bytes, std::string& out) {
-    for (std::size_t i = bytes; i-- > 0;) out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
-}
-
 std::uint64_t get_be(std::string_view b, std::size_t bytes) {
     if (b.size() != bytes)
         bad_data("binary value", "expected " + std::to_string(bytes) + " bytes, got " + std::to_string(b.size()));
@@ -111,25 +107,18 @@ std::string format_scaled(std::int64_t units, int scale) {
 }
 
 void encode_scaled(std::int64_t units, int scale, std::string& out) {
-    std::string d = std::to_string(magnitude(units));
-    const auto s = static_cast<std::size_t>(scale);
-    if (d.size() <= s) d.insert(0, s + 1 - d.size(), '0');
-    const std::size_t whole = d.size() - s;
-    d.insert(0, (4 - whole % 4) % 4, '0');  // base-10000 groups count from the point
-    d.append((4 - s % 4) % 4, '0');
-    std::vector<int> groups;
-    for (std::size_t i = 0; i < d.size(); i += 4) groups.push_back(std::stoi(d.substr(i, 4)));
-    int weight = static_cast<int>((whole + 3) / 4) - 1;
-    std::size_t lead = 0;
-    while (lead < groups.size() && groups[lead] == 0) ++lead;
-    groups.erase(groups.begin(), groups.begin() + static_cast<std::ptrdiff_t>(lead));
-    while (!groups.empty() && groups.back() == 0) groups.pop_back();
-    weight = groups.empty() ? 0 : weight - static_cast<int>(lead);
-    put_be(groups.size(), 2, out);
-    put_be(static_cast<std::uint16_t>(weight), 2, out);
-    put_be(units < 0 && !groups.empty() ? sign_neg : 0, 2, out);
-    put_be(s, 2, out);
-    for (int g : groups) put_be(static_cast<std::uint64_t>(g), 2, out);
+    std::uint64_t m = magnitude(units), div = 10'000, mul = 1;
+    const int pad = (4 - scale % 4) % 4;  // base-10000 groups count from the point: the lowest one is short
+    for (int i = 0; i < pad; ++i) div /= 10, mul *= 10;
+    int g[6], n = 0;  // the groups, lowest first
+    for (; m; m /= div, div = 10'000, mul = 1) g[n++] = static_cast<int>(m % div * mul);
+    int low = 0;  // trailing zero groups are left out
+    while (low < n && g[low] == 0) ++low;
+    put_be(static_cast<std::uint64_t>(n - low), 2, out);
+    put_be(static_cast<std::uint16_t>(n > low ? n - 1 - (scale + pad) / 4 : 0), 2, out);
+    put_be(units < 0 && n > low ? sign_neg : 0, 2, out);
+    put_be(static_cast<std::uint64_t>(scale), 2, out);
+    for (int i = n; i-- > low;) put_be(static_cast<std::uint64_t>(g[i]), 2, out);
 }
 
 std::int64_t decode_scaled(std::string_view b, int scale) {

@@ -4,6 +4,7 @@
 #include <functional>
 
 #include "pool.hpp"
+#include "shape.hpp"
 
 namespace pg {
 
@@ -13,7 +14,7 @@ struct lost_posting { std::string reason; error_kind kind = error_kind::other; s
 
 struct writeback_options {
     std::chrono::milliseconds interval{200};             // a batch is written this often
-    std::chrono::milliseconds refresh{1'000};            // loaded slots older than this are re-read
+    std::chrono::milliseconds refresh{1'000};            // loaded slots older than this are re-read, or dropped when nobody read them
     std::size_t backlog_limit = 100'000;                 // postings recorded but not settled
     std::chrono::milliseconds shutdown_timeout{10'000};  // the destructor's flush gives up after this
     std::function<void(const lost_posting&)> on_lost;    // runs on the writer thread; empty: stderr
@@ -56,34 +57,30 @@ template <class Col, class... A>
 concept counter_for = counter_value<typename Col::pg_type> && std::tuple_size_v<typename Col::pg_table::key> == sizeof...(A);
 
 // A key: its counter's address, then each value as its type OID, its length and its binary bytes.
-std::string pack_param(std::string out, const param& p);
+void pack_param(std::string& out, const param& p);
 template <class Col, class... K, std::size_t... I>
-std::string pack_key(std::index_sequence<I...>, K&&... k) {
+void pack_key(std::string& out, std::index_sequence<I...>, K&&... k) {
     const counter* d = &counter_of<Col>;
-    std::string out(reinterpret_cast<const char*>(&d), sizeof d);
-    ((out = pack_param(std::move(out), to_param(static_cast<std::tuple_element_t<I, typename Col::pg_table::key>>(std::forward<K>(k))))), ...);
-    return out;
+    out.assign(reinterpret_cast<const char*>(&d), sizeof d);
+    (pack_param(out, to_param(static_cast<std::tuple_element_t<I, typename Col::pg_table::key>>(std::forward<K>(k)))), ...);
 }
 template <class Col, class... K>
-std::string key_of(K&&... k) { return pack_key<Col>(std::index_sequence_for<K...>{}, std::forward<K>(k)...); }
+std::string key_of(K&&... k) { std::string out; pack_key<Col>(out, std::index_sequence_for<K...>{}, std::forward<K>(k)...); return out; }
 
 // One row to insert: the columns given (an unset field is left to DEFAULT) and their values.
-struct wb_row { std::string_view table; std::vector<std::string_view> columns; std::vector<param> values; };
+struct wb_row { std::string_view table; std::vector<copy_column> columns; std::vector<param> values; };
 struct wb_delta { const counter* def; std::string key; std::int64_t units; };  // key: packed by key_of
 
 template <write_shape W>
 wb_row row_of(const W& row) {
     wb_row r{W::pg_table::name, {}, {}};
+    r.columns.reserve(W::pg_names.size()), r.values.reserve(W::pg_names.size());
     std::size_t i = 0;
     row.pg_each([&](const auto& m) {
-        const std::string_view name = W::pg_names[i++];
-        if constexpr (is_field<std::remove_cvref_t<decltype(m)>>) {
-            if (!m.is_set()) return;
-            r.values.push_back(to_param(m.value()));
-        } else {
-            r.values.push_back(to_param(m));
-        }
-        r.columns.push_back(name);
+        using V = std::remove_cvref_t<decltype(written(m))>;
+        constexpr std::string_view type = type_name<V>();
+        if (is_set(m)) r.columns.push_back({W::pg_names[i], &codec_of<V>::accepts, type}), r.values.push_back(to_param(written(m)));
+        ++i;
     });
     if (r.columns.empty()) throw error(error_kind::other, "posting::insert: no column to insert");
     return r;
@@ -143,7 +140,9 @@ public:
     template <class Col, class... K>
         requires detail::counter_for<Col, K...>
     typename Col::pg_type get(K&&... key) {
-        return detail::units<typename Col::pg_type>::from(value(detail::counter_of<Col>, detail::key_of<Col>(std::forward<K>(key)...)));
+        thread_local std::string k;  // reused, so that reading a key in memory allocates nothing
+        detail::pack_key<Col>(k, std::index_sequence_for<K...>{}, std::forward<K>(key)...);
+        return detail::units<typename Col::pg_type>::from(value(detail::counter_of<Col>, k));
     }
 
     // Applies the posting's deltas to memory at once and queues it; over the

@@ -536,12 +536,20 @@ TEST_CASE("get inside a transaction of the pool throws for hot and cold keys ali
         REQUIRE_THROWS_AS(db().transact([&](pg::conn& c) { return c.exec(sql{"SELECT 1"}), wb.get<points>(id); }), pg::nested_borrow);
 }
 
-TEST_CASE("write shapes with different types for a column are inserted by their own statements", "[writeback]") {
+TEST_CASE("a row whose member type is unlike its column is lost while the rest of its batch commits", "[writeback]") {
     reset();
-    pg::writeback wb(db(), manual());
-    wb.submit(pg::posting{}.insert(points_write<std::int64_t>{.id = 10, .points = 1}).insert(points_write<std::int32_t>{.id = 11, .points = 2}));
+    lost_log lost;
+    auto o = manual();
+    o.on_lost = lost.sink();
+    pg::writeback wb(db(), o);
+    wb.submit(pg::posting{}.insert(points_write<std::int64_t>{.id = 10, .points = 1}));
+    wb.submit(pg::posting{}.insert(points_write<std::int32_t>{.id = 11, .points = 2}));
     wb.flush();
+    const auto l = lost.get();
+    REQUIRE(l.size() == 1);
+    CHECK(l[0].kind == pg::error_kind::data);
+    CHECK(l[0].reason.find("\"points\" has type OID 20") != std::string::npos);
     CHECK(db_points(10) == 1);
-    CHECK(db_points(11) == 2);
-    CHECK(receipts() == 1);
+    CHECK(scalar<std::int64_t>(sql{"SELECT count(*) FROM wb_balances WHERE id = 11"}) == 0);
+    CHECK(wb.stats().committed == 1);
 }

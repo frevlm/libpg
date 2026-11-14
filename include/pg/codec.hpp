@@ -83,7 +83,12 @@ struct codec;
 
 namespace detail {
 
-void put_be(std::uint64_t v, std::size_t bytes, std::string& out);
+// Appends the low `bytes` bytes of v, big-endian.
+inline void put_be(std::uint64_t v, std::size_t bytes, std::string& out) {
+    char b[8];  // one append: per-byte push_back costs a capacity check each
+    for (std::size_t i = 0; i < bytes; ++i) b[i] = static_cast<char>(v >> (8 * (bytes - 1 - i)));
+    out.append(b, bytes);
+}
 // The big-endian integer of exactly `bytes` bytes; another length throws pg::error.
 std::uint64_t get_be(std::string_view b, std::size_t bytes);
 
