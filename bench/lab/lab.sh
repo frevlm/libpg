@@ -8,7 +8,8 @@
 #   lab.sh load FILE.sql            run a SQL file against the lab database
 #   lab.sh ab A B SCENARIO...       interleaved wall-clock runs of variants A and B
 #   lab.sh run NAME SCENARIO...     interleaved wall-clock runs of scenarios of one build
-#   lab.sh cpu A B SCENARIO:FN...   callgrind marginal instructions per call of FN
+#   lab.sh cpu A B SCENARIO:FN...   callgrind marginal instructions per call of FN (gives NA since
+#                                   the harness dumps the window; use cgwin)
 #   lab.sh fleet NAME PODS direct|bouncer SCENARIO...
 #                                   PODS processes at once (one pool each), totals
 #   lab.sh pgss NAME SCENARIO...    server statement totals over the measured window (pg_stat_statements)
@@ -18,7 +19,10 @@
 #
 # Environment: LAB_HOST (required, user@host of the lab), REPS [5], DURATION [3],
 #   THREADS ["1 16"], POOL [8], DELAY_US [0] (added to every round trip),
-#   BENCH_CPUS [1] (cpuset of the bench container; "0-1" for in-process contention)
+#   BENCH_CPUS [1] (cpuset of the bench container; "0-1" for in-process contention),
+#   LAB_PG [libpg-lab-pg] (server container; setup and build bind it, a variant keeps
+#   the server it was built for), LAB_PG_IMAGE [postgres:18] (setup), LAB_PQ (build:
+#   a libpq unpacked with dpkg -x under /lab, used instead of the image's)
 #
 # The server is pinned to CPU 0 and the bench to CPU 1, both at low CPU share,
 # because the host also runs production services. Results land in
@@ -28,17 +32,24 @@ H=${LAB_HOST:?set LAB_HOST to the lab host as user@host}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 BENCH_CPUS=${BENCH_CPUS:-1} REPS=${REPS:-5} DURATION=${DURATION:-3} THREADS=${THREADS:-"1 16"} POOL=${POOL:-8} DELAY_US=${DELAY_US:-0}
+PG=${LAB_PG:-libpg-lab-pg} PG_IMAGE=${LAB_PG_IMAGE:-postgres:18}
+vol=libpg-lab-data${PG#libpg-lab-pg}
 
 remote() { ssh -o BatchMode=yes "$H" "$@"; }
 # Runs inner.sh in a fresh bench container.
 # The server's cgroup is mounted read-only so the bench can report server CPU per
 # operation (LIBPG_BENCH_SERVER_CPU, bench/harness.cpp).
 inner() {
-  remote "docker run --rm --network libpg-lab --cpuset-cpus $BENCH_CPUS --cpu-shares 256 --cap-add NET_ADMIN \
+  remote "PG=$PG PQ=; [ -f ~/libpg-lab/v/$2/lab.env ] && . ~/libpg-lab/v/$2/lab.env
+    docker run --rm --network libpg-lab --cpuset-cpus $BENCH_CPUS --cpu-shares 256 --cap-add NET_ADMIN \
     -v \$HOME/libpg-lab:/lab -v /sys/fs/cgroup:/hostcg:ro \
-    -e LIBPG_BENCH_SERVER_CPU=/hostcg/system.slice/docker-\$(docker inspect -f '{{.Id}}' libpg-lab-pg).scope/cpu.stat \
+    -e LIBPG_BENCH_SERVER_CPU=/hostcg/system.slice/docker-\$(docker inspect -f '{{.Id}}' \$PG).scope/cpu.stat \
+    -e LAB_PG=\$PG -e LAB_PQ=\$PQ \
     ${INNER_ENV:-} libpg-lab nice -n 10 bash /lab/bin/inner.sh $*"
 }
+
+# Binds PG and PQ to the server and libpq that variant $1 was built for.
+bind() { eval "$(remote "cat ~/libpg-lab/v/$1/lab.env 2>/dev/null")"; }
 
 sync_tree() {
   rsync -az --delete --exclude 'build*' --exclude .git --exclude bench/results "$root/" "$H:libpg-lab/src/"
@@ -52,25 +63,28 @@ setup)
   sync_tree
   remote 'docker build -q -t libpg-lab ~/libpg-lab/image >/dev/null
     docker network inspect libpg-lab >/dev/null 2>&1 || docker network create libpg-lab >/dev/null
-    if ! docker inspect libpg-lab-pg >/dev/null 2>&1; then
-      docker run -d --name libpg-lab-pg --network libpg-lab --cpuset-cpus 0 --cpu-shares 256 --memory 512m \
-        -e POSTGRES_HOST_AUTH_METHOD=trust -v libpg-lab-data:/var/lib/postgresql postgres:18 \
+    if ! docker inspect '"$PG"' >/dev/null 2>&1; then
+      docker run -d --name '"$PG"' --network libpg-lab --cpuset-cpus 0 --cpu-shares 256 --memory 512m \
+        -e POSTGRES_HOST_AUTH_METHOD=trust -v '"$vol"':/var/lib/postgresql '"$PG_IMAGE"' \
         -c shared_buffers=128MB -c max_connections=100 \
         -c shared_preload_libraries=pg_stat_statements >/dev/null
-      until docker exec libpg-lab-pg pg_isready -q -U postgres; do sleep 1; done
+      until docker exec '"$PG"' pg_isready -q -U postgres; do sleep 1; done
       # Off by default (lab.sh pgss turns it on); set here, not with -c, so that
       # ALTER SYSTEM can change it.
-      docker exec libpg-lab-pg psql -U postgres -qc "ALTER SYSTEM SET pg_stat_statements.track = '"'"'none'"'"'" \
+      docker exec '"$PG"' psql -U postgres -qc "ALTER SYSTEM SET pg_stat_statements.track = '"'"'none'"'"'" \
         -c "SELECT pg_reload_conf()" >/dev/null
     fi
-    docker exec libpg-lab-pg psql -U postgres -qtAc "SELECT 1 FROM pg_database WHERE datname = '"'"'bench'"'"'" | grep -q 1 ||
-      { docker exec libpg-lab-pg createdb -U postgres bench &&
-        docker exec -i libpg-lab-pg psql -U postgres -q -v ON_ERROR_STOP=1 -d bench < ~/libpg-lab/src/bench/schema.sql; }'
+    docker start '"$PG"' >/dev/null
+    until docker exec '"$PG"' pg_isready -q -U postgres; do sleep 1; done
+    docker exec '"$PG"' psql -U postgres -qtAc "SELECT 1 FROM pg_database WHERE datname = '"'"'bench'"'"'" | grep -q 1 ||
+      { docker exec '"$PG"' createdb -U postgres bench &&
+        docker exec -i '"$PG"' psql -U postgres -q -v ON_ERROR_STOP=1 -d bench < ~/libpg-lab/src/bench/schema.sql; }'
   echo "lab ready on $H" ;;
 build)
   name=$2; shift 2
   sync_tree
-  remote "rm -rf ~/libpg-lab/v/$name/src && mkdir -p ~/libpg-lab/v/$name && cp -a ~/libpg-lab/src ~/libpg-lab/v/$name/src"
+  remote "rm -rf ~/libpg-lab/v/$name/src && mkdir -p ~/libpg-lab/v/$name && cp -a ~/libpg-lab/src ~/libpg-lab/v/$name/src
+    echo 'PG=$PG PQ=${LAB_PQ:-}' > ~/libpg-lab/v/$name/lab.env"
   for p in "$@"; do
     rsync -az "$p" "$H:libpg-lab/v/$name/$(basename "$p")"
     remote "cd ~/libpg-lab/v/$name/src && patch -p1 -s < ../$(basename "$p")"
@@ -93,7 +107,7 @@ ab)
   echo "delay ${DELAY_US} µs/round trip, ${REPS} reps × ${DURATION}s, raw: ~/libpg-lab/$out"
   remote "python3 ~/libpg-lab/bin/summarize.py ~/libpg-lab/$out $a $b" ;;
 load)
-  remote "docker exec -i libpg-lab-pg psql -U postgres -q -v ON_ERROR_STOP=1 -d bench" < "$2"
+  remote "docker exec -i $PG psql -U postgres -q -v ON_ERROR_STOP=1 -d bench" < "$2"
   echo "loaded $2" ;;
 run)
   name=$2; shift 2
@@ -124,28 +138,31 @@ fleet)
 pgss)
   # Tracking is on only for these runs: it costs the server per statement.
   name=$2; shift 2
-  remote "docker exec libpg-lab-pg psql -U postgres -d bench -qc 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements' \
+  bind "$name"
+  remote "docker exec $PG psql -U postgres -d bench -qc 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements' \
     -c \"ALTER SYSTEM SET pg_stat_statements.track = 'top'\" -c 'SELECT pg_reload_conf()' >/dev/null"
   for s in "$@"; do
-    INNER_ENV="-e LIBPG_BENCH_PGSS=postgresql://postgres@libpg-lab-pg/bench" \
+    INNER_ENV="-e LIBPG_BENCH_PGSS=postgresql://postgres@$PG/bench" \
       inner run "$name" "$DELAY_US" --duration "$DURATION" --threads "\"$THREADS\"" --pool "$POOL" "$s" 2>&1 |
       grep -E '^(pgss|real_|v[0-9])' | grep -v ' pool=' || true
   done
-  remote "docker exec libpg-lab-pg psql -U postgres -d bench -qc \"ALTER SYSTEM SET pg_stat_statements.track = 'none'\" \
+  remote "docker exec $PG psql -U postgres -d bench -qc \"ALTER SYSTEM SET pg_stat_statements.track = 'none'\" \
     -c 'SELECT pg_reload_conf()' >/dev/null" ;;
 perf)
   # Server CPU by PostgreSQL stage (perfsplit.py): the bench saturates the server
   # with PERF_THREADS [16] while perf samples only the server's cgroup, inside the
   # bench's measured window; the bench's server CPU per operation scales it.
   name=$2; shift 2
+  bind "$name"
   rsync -az "$here/perfsplit.py" "$H:libpg-lab/bin/"
   for s in "$@"; do
     echo "## $s"
-    remote "id=\$(docker inspect -f '{{.Id}}' libpg-lab-pg)
+    remote "id=\$(docker inspect -f '{{.Id}}' $PG)
       docker run -d --name libpg-lab-perfload --network libpg-lab --cpuset-cpus $BENCH_CPUS --cpu-shares 256 \
         -v \$HOME/libpg-lab:/lab -v /sys/fs/cgroup:/hostcg:ro \
-        -e LIBPG_BENCH_SERVER_CPU=/hostcg/system.slice/docker-\$id.scope/cpu.stat libpg-lab \
-        bash -c '/lab/v/$name/build/bench/pg_bench --dsn postgresql://postgres@libpg-lab-pg/bench --pool $POOL \
+        -e LIBPG_BENCH_SERVER_CPU=/hostcg/system.slice/docker-\$id.scope/cpu.stat \
+        ${PQ:+-e LD_LIBRARY_PATH=$PQ/usr/lib/x86_64-linux-gnu} libpg-lab \
+        bash -c '/lab/v/$name/build/bench/pg_bench --dsn postgresql://postgres@$PG/bench --pool $POOL \
           --threads ${PERF_THREADS:-16} --duration 25 $s 2>/dev/null | grep ^$s, > /lab/results/perf-$s.line' >/dev/null
       sleep 3
       sudo -n perf record -q -o /tmp/pgperf.data -a -e cpu-clock -G system.slice/docker-\$id.scope -F 999 \
@@ -166,7 +183,7 @@ cgwin)
   remote "cd ~/libpg-lab/$out && for f in *.window; do python3 ~/libpg-lab/bin/cgsplit.py \$f; done"
   echo "dumps: ~/libpg-lab/$out" ;;
 teardown)
-  remote 'docker rm -f libpg-lab-pg >/dev/null 2>&1; docker network rm libpg-lab >/dev/null 2>&1; true'
-  echo "lab stopped (volume libpg-lab-data kept)" ;;
-*) sed -n '2,20p' "$0"; exit 2 ;;
+  remote "docker rm -f $PG >/dev/null 2>&1; docker network rm libpg-lab >/dev/null 2>&1; true"
+  echo "$PG stopped (volume $vol kept)" ;;
+*) sed -n '2,26p' "$0"; exit 2 ;;
 esac

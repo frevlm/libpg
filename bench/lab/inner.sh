@@ -6,12 +6,20 @@
 #   inner.sh cgwin NAME OUTDIR DURATION scenario
 #   inner.sh fleet NAME DELAY_US PODS direct|bouncer pg_bench-args...
 set -eu
-DSN=postgresql://postgres@libpg-lab-pg/bench
+DSN=postgresql://postgres@${LAB_PG:-libpg-lab-pg}/bench
+# LAB_PQ: a libpq tree unpacked with dpkg -x, built against and loaded instead of the image's.
+pq=()
+if [ -n "${LAB_PQ:-}" ]; then
+  export LD_LIBRARY_PATH=$LAB_PQ/usr/lib/x86_64-linux-gnu
+  pq=(-DPostgreSQL_INCLUDE_DIR=$LAB_PQ/usr/include/postgresql -DPostgreSQL_LIBRARY=$LD_LIBRARY_PATH/libpq.so)
+fi
 cmd=$1 name=$2; shift 2
 bin=/lab/v/$name/build/bench/pg_bench
 case $cmd in
 build)
-  cmake -S /lab/v/$name/src -B /lab/v/$name/build -DCMAKE_BUILD_TYPE=Release -DLIBPG_BENCH=ON >/dev/null
+  # From scratch: the cache would keep a libpq found by an earlier build.
+  rm -rf /lab/v/$name/build
+  cmake -S /lab/v/$name/src -B /lab/v/$name/build -DCMAKE_BUILD_TYPE=Release -DLIBPG_BENCH=ON "${pq[@]}" >/dev/null
   cmake --build /lab/v/$name/build -j2 --target pg_bench >/dev/null ;;
 run)
   delay=$1; shift

@@ -8,7 +8,7 @@ if(LIBPG_TEST_SERVER)
   find_program(LIBPG_PG_TOOL psql)
 else()
   # LIBPG_PG_CTL names pg_ctl when it is not on PATH (CI passes it).
-  find_program(LIBPG_PG_CTL pg_ctl HINTS /opt/homebrew/opt/postgresql@18/bin)
+  find_program(LIBPG_PG_CTL pg_ctl HINTS /opt/homebrew/opt/postgresql@19/bin /opt/homebrew/opt/postgresql@18/bin)
   set(LIBPG_PG_TOOL ${LIBPG_PG_CTL})
 endif()
 if(NOT Catch2_FOUND OR NOT LIBPG_PG_TOOL)

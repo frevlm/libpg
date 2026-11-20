@@ -14,15 +14,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # libpq 16: the pre-17 engine path. The server is PostgreSQL 18 in a
-          # container: the query-file fixtures use RETURNING old/new.
+          # libpq 16 against PostgreSQL 19 in a container (the query-file
+          # fixtures use RETURNING old/new, so the server must be 18 or newer).
           - name: ubuntu-gcc-libpq16
             os: ubuntu-24.04
             test_server: postgresql://postgres@127.0.0.1:5432
-          # libpq 18: the 17+ engine path, on a local cluster
-          - name: macos-clang-pg18
+          # libpq 19 and PostgreSQL 19 on a local cluster
+          - name: macos-clang-pg19
             os: macos-26
-            pg_ctl: /opt/homebrew/opt/postgresql@18/bin/pg_ctl
+            pg_ctl: /opt/homebrew/opt/postgresql@19/bin/pg_ctl
     steps:
       - uses: actions/checkout@v5
 
@@ -31,12 +31,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ninja-build libpq-dev postgresql-client catch2
-          docker run -d --name pg -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18
+          docker run -d --name pg -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:19
           until pg_isready -q -h 127.0.0.1 -p 5432; do sleep 1; done
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja libpq postgresql@18 catch2
+        run: brew install ninja libpq postgresql@19 catch2
 
       - name: Configure
         run: >-

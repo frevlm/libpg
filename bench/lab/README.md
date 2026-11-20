@@ -220,3 +220,28 @@ Allocation is the largest reducible part of the auto form: 137 malloc + 138 oper
 bookkeeping: observe 10k, scope clear 7k, record 5k, slicing 5k, `run_plan`'s own code ≈6k. The client CPU in µs
 (user + kernel) is equal for list auto and join (93 vs 95): one round trip fewer pays for the bookkeeping, since
 each round trip costs the client ≈25–30 µs of kernel time as well.
+
+## PostgreSQL 19 (2026-11-19, libpg 0.4.0)
+
+Setup: a second server, `LAB_PG=libpg-lab-pg19 LAB_PG_IMAGE=postgres:19 lab.sh setup`, with the same flags and
+its own volume. Both servers were reseeded from `schema.sql` and `schema_real.sql`, then `VACUUM ANALYZE` and
+restarted. A server that has been up for weeks has its buffers in swap: its point reads ran 5.8× slower before
+the restart. libpq 19 was unpacked with `dpkg -x` into `/lab/pq19` and selected per build (`LAB_PQ`).
+
+Variants: `s18` is server 18 with libpq 18.7, `s19` is server 19 with libpq 18.7, `s19q19` is server 19 with
+libpq 19.0. Ctest passes 20/20 ×3 against server 19 with both libpqs. `pg_tablegen` output is unchanged.
+
+| question | method | result |
+|---|---|---|
+| client: libpq 19 vs 18 | `cgwin`, instructions per operation | identical: get_row 17,112 → 17,108, list_50 261,045 → 261,507, tx3 42,183 → 42,173. libpq 19 adds only OAuth v2 and `PQgetThreadLock` |
+| server: point read, list, tx3, COPY, real handlers | `ab s18 s19` (6 reps, 1 and 16 threads, delay 0 and 500 µs) and null `ab s19 s19n` | within noise: srv_us 51.8 → 51.6 (get_row), 20.8 → 20.4 (wb_requests), 545 → 544 (mix_best) |
+| server: `v2_list_50` at 1 thread, which the first run called faster (229 → 209) | repeated on freshly restarted servers, 8 reps | 208 → 210, within noise |
+| server: a 44k-row filtered index scan, warm cache (`real_dash_day_agg`, `_proj`) | `ab`, 8 reps, 1 thread; `_proj` repeated without `all_agg` in the batch | srv_us −13%: 7785 → 6788 (agg) and 7609 → 6559 (proj), the ranges do not overlap; control `v2_get_row` 49.8 → 49.9. Same plan; the projection form gains as much as the aggregate form, so the gain is in the scan rather than the aggregation |
+| server: a 40k-page cold bitmap heap scan (`real_dash_all_agg`) | `EXPLAIN ANALYZE` ×3 | 5.2–6.0 s → 1.8–3.1 s. The cause is a default: 19 scales IO workers 2..8 where 18 has `io_workers=3`. 19 capped at 3 workers: 5.0–6.0 s. 18 with `io_workers=8`: 2.8–3.1 s |
+
+Noise floor of srv_us (null A/B, server 19 against itself): medians of 1-thread runs differ by up to 0.80–1.26×
+(list_join, get_row), because a few reps are slow. Judge on the range overlap and on the minimum.
+
+Default settings that differ and can matter: `jit` off (18: on; no lab query reaches `jit_above_cost`),
+`default_toast_compression=lz4`, `max_locks_per_transaction=128`, `enable_eager_aggregate=on`, IO workers
+scaled 2..8.
