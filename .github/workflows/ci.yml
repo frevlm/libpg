@@ -36,7 +36,8 @@ jobs:
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja libpq postgresql@19 catch2
+        # The runner's formula index can predate postgresql@19.
+        run: brew update && brew install ninja libpq postgresql@19 catch2
 
       - name: Configure
         run: >-
